@@ -1,0 +1,404 @@
+//! # Encoding
+//!
+//! Quoted-printable encoding of a MIME body, in lines of at most 76
+//! characters soft break included (RFC 2045 6.7).
+//!
+//! In text mode, LF and CRLF become hard line breaks; in binary mode, CR and
+//! LF are escaped like any other byte and the output has soft line breaks
+//! only. `=`, bytes from 0x7F up, control characters other than TAB, a bare
+//! CR in text mode and a space or tab that would end a line are escaped as
+//! `=XX`, uppercase; an escape is never split across lines.
+//!
+//! [`QuotedPrintableEncode`] takes the input chunk by chunk; [`encode`] and `encode_vec`
+//! run it once over a whole input. Decoding is the sibling module
+//! [`decode`](crate::decode).
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+
+use crate::queue::Queue;
+
+/// The most characters a line holds before its soft break `=`.
+const LINE_CONTENT: usize = 75;
+
+/// The longest output of one input byte: a pending blank, a pending CR and
+/// the byte itself, each escaped after a CRLF soft break.
+const STEP_MAX: usize = 3 * (3 + 3);
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// I/O-free quoted-printable encoder, resumed with the caller's input and
+/// output buffers.
+///
+/// The input can be cut anywhere: the encoder carries a trailing space or
+/// tab, and a trailing CR in text mode, until the next byte tells whether a
+/// line ends there.
+///
+/// ```
+/// use quoted_printable_codec::encode::{QuotedPrintableEncode, QuotedPrintableEncodeOptions};
+///
+/// let mut encoder = QuotedPrintableEncode::new(QuotedPrintableEncodeOptions::default());
+/// let mut out = [0; 32];
+///
+/// let first = encoder.resume(b"a = b ", &mut out);
+/// let second = encoder.resume(b"\r\nc ", &mut out[first.written..]);
+/// let written = first.written + second.written;
+/// let end = encoder.finish(&mut out[written..]).unwrap();
+///
+/// assert_eq!(&out[..written + end], b"a =3D b=20\r\nc=20");
+/// ```
+///
+/// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
+#[derive(Clone, Debug)]
+pub struct QuotedPrintableEncode {
+    opts: QuotedPrintableEncodeOptions,
+    column: usize,
+    blank: Option<u8>,
+    cr: bool,
+    queue: Queue<STEP_MAX>,
+}
+
+impl QuotedPrintableEncode {
+    /// Builds an encoder.
+    pub fn new(opts: QuotedPrintableEncodeOptions) -> Self {
+        Self {
+            opts,
+            column: 0,
+            blank: None,
+            cr: false,
+            queue: Queue::new(),
+        }
+    }
+
+    /// Encodes as much of `src` as fits in `dst`.
+    ///
+    /// The caller drains `dst` and resumes with the rest of `src` or the
+    /// next chunk; one byte of room always lets the encoder progress.
+    pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableEncodeOutput {
+        let mut read = 0;
+        let mut written = 0;
+
+        loop {
+            written += self.queue.drain(&mut dst[written..]);
+
+            if !self.queue.is_empty() || read == src.len() {
+                return QuotedPrintableEncodeOutput { read, written };
+            }
+
+            self.step(src[read]);
+            read += 1;
+        }
+    }
+
+    /// Ends the input: writes what is still queued and the carried space,
+    /// tab or CR, escaped as the end of the input asks.
+    ///
+    /// Returns the bytes written, or none, writing nothing, when `dst` is
+    /// too short.
+    pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
+        if self.cr {
+            self.cr = false;
+
+            if let Some(blank) = self.blank.take() {
+                self.literal(blank);
+            }
+
+            self.escape(b'\r');
+        } else if let Some(blank) = self.blank.take() {
+            self.escape(blank);
+        }
+
+        if dst.len() < self.queue.len() {
+            return None;
+        }
+
+        Some(self.queue.drain(dst))
+    }
+
+    /// Encodes one byte into the queue, deciding first what the carried
+    /// bytes become now that this one follows them.
+    fn step(&mut self, byte: u8) {
+        let text = !self.opts.binary;
+
+        if self.cr {
+            self.cr = false;
+
+            if byte == b'\n' {
+                if let Some(blank) = self.blank.take() {
+                    self.escape(blank);
+                }
+
+                return self.hard_break();
+            }
+
+            if let Some(blank) = self.blank.take() {
+                self.literal(blank);
+            }
+
+            self.escape(b'\r');
+        }
+
+        if let Some(blank) = self.blank {
+            match byte {
+                b'\n' if text => {
+                    self.blank = None;
+                    self.escape(blank);
+                    return self.hard_break();
+                }
+                b'\r' if text => {
+                    self.cr = true;
+                    return;
+                }
+                _ => {
+                    self.blank = None;
+                    self.literal(blank);
+                }
+            }
+        }
+
+        match byte {
+            b' ' | b'\t' => self.blank = Some(byte),
+            b'\n' if text => self.hard_break(),
+            b'\r' if text => self.cr = true,
+            b'!'..=b'<' | b'>'..=b'~' => self.literal(byte),
+            _ => self.escape(byte),
+        }
+    }
+
+    fn literal(&mut self, byte: u8) {
+        self.room(1);
+        self.queue.push(&[byte]);
+        self.column += 1;
+    }
+
+    fn escape(&mut self, byte: u8) {
+        self.room(3);
+        let hex = [
+            b'=',
+            HEX[usize::from(byte >> 4)],
+            HEX[usize::from(byte & 0xf)],
+        ];
+        self.queue.push(&hex);
+        self.column += 3;
+    }
+
+    /// Ends the line with a soft break when `len` more characters would
+    /// pass its content.
+    fn room(&mut self, len: usize) {
+        if self.column + len > LINE_CONTENT {
+            self.queue.push(b"=");
+            self.queue.push(self.opts.eol.bytes());
+            self.column = 0;
+        }
+    }
+
+    fn hard_break(&mut self) {
+        self.queue.push(self.opts.eol.bytes());
+        self.column = 0;
+    }
+}
+
+/// Options of [`QuotedPrintableEncode`] and [`encode`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuotedPrintableEncodeOptions {
+    /// The line ending of hard and soft line breaks. Defaults to CRLF.
+    pub eol: QuotedPrintableEol,
+    /// Whether CR and LF are escaped as data rather than read as line
+    /// breaks, as binary content such as an attachment needs. Defaults to
+    /// text.
+    pub binary: bool,
+}
+
+/// The line ending of the output.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum QuotedPrintableEol {
+    /// CR LF, as the wire format of mail has it.
+    #[default]
+    Crlf,
+    /// LF alone, as mail stored on disk often has it.
+    Lf,
+}
+
+impl QuotedPrintableEol {
+    const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Crlf => b"\r\n",
+            Self::Lf => b"\n",
+        }
+    }
+}
+
+/// What an encoding call did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotedPrintableEncodeOutput {
+    /// The input bytes consumed.
+    pub read: usize,
+    /// The output bytes written.
+    pub written: usize,
+}
+
+/// Encodes the whole of `src` into `dst`, returning the bytes written.
+///
+/// Returns none, writing nothing, when `dst` is shorter than
+/// [`encoded_len_max`] asks.
+pub fn encode(src: &[u8], dst: &mut [u8], opts: QuotedPrintableEncodeOptions) -> Option<usize> {
+    let len = encoded_len_max(src.len(), opts)?;
+    let dst = dst.get_mut(..len)?;
+    let mut encoder = QuotedPrintableEncode::new(opts);
+    let output = encoder.resume(src, dst);
+    let end = encoder.finish(&mut dst[output.written..])?;
+    Some(output.written + end)
+}
+
+/// Encodes the whole of `src` at the end of `out`.
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub fn encode_vec(src: &[u8], out: &mut Vec<u8>, opts: QuotedPrintableEncodeOptions) {
+    let start = out.len();
+    out.resize(
+        start + encoded_len_max(src.len(), opts).unwrap_or(usize::MAX),
+        0,
+    );
+
+    let written = encode(src, &mut out[start..], opts).unwrap_or(0);
+    out.truncate(start + written);
+}
+
+/// The most bytes [`encode`] writes for an input of `len` bytes, whatever
+/// they hold, or none when that overflows `usize`.
+///
+/// Every byte takes at most three characters, and a soft break follows at
+/// least 73 characters, so at least 25 input bytes.
+pub fn encoded_len_max(len: usize, opts: QuotedPrintableEncodeOptions) -> Option<usize> {
+    let breaks = (len / 25 + 1).checked_mul(1 + opts.eol.bytes().len())?;
+    len.checked_mul(3)?.checked_add(breaks)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use crate::encode::*;
+
+    const BINARY: QuotedPrintableEncodeOptions = QuotedPrintableEncodeOptions {
+        eol: QuotedPrintableEol::Crlf,
+        binary: true,
+    };
+
+    fn encoded(input: &[u8], opts: QuotedPrintableEncodeOptions) -> Vec<u8> {
+        let mut out = vec![0; encoded_len_max(input.len(), opts).unwrap()];
+        let written = encode(input, &mut out, opts).unwrap();
+        out.truncate(written);
+        out
+    }
+
+    fn text(input: &[u8]) -> Vec<u8> {
+        encoded(input, QuotedPrintableEncodeOptions::default())
+    }
+
+    #[test]
+    fn printable_ascii_stays_literal() {
+        assert_eq!(text(b"Hello, world!"), b"Hello, world!");
+        assert_eq!(text(b"a=b"), b"a=3Db");
+        assert_eq!(text("é".as_bytes()), b"=C3=A9");
+        assert_eq!(text(b"\x00\x7f"), b"=00=7F");
+    }
+
+    #[test]
+    fn line_breaks_become_crlf() {
+        assert_eq!(text(b"a\nb\r\nc"), b"a\r\nb\r\nc");
+        assert_eq!(text(b"a\rb"), b"a=0Db");
+        assert_eq!(text(b"a\r"), b"a=0D");
+
+        let lf = QuotedPrintableEncodeOptions {
+            eol: QuotedPrintableEol::Lf,
+            binary: false,
+        };
+
+        assert_eq!(encoded(b"a\r\nb", lf), b"a\nb");
+    }
+
+    #[test]
+    fn line_final_blanks_are_escaped() {
+        assert_eq!(text(b"a \nb\t\r\nc "), b"a=20\r\nb=09\r\nc=20");
+        assert_eq!(text(b"a  b"), b"a  b");
+        assert_eq!(text(b"a \rb"), b"a =0Db");
+        assert_eq!(text(b"a \r"), b"a =0D");
+    }
+
+    #[test]
+    fn binary_escapes_line_breaks() {
+        assert_eq!(encoded(b"a\r\nb \n", BINARY), b"a=0D=0Ab =0A");
+    }
+
+    #[test]
+    fn long_lines_get_soft_breaks() {
+        let out = text(&[b'x'; 80]);
+        assert_eq!(out.len(), 83);
+        assert_eq!(&out[75..78], b"=\r\n");
+
+        let out = text(&[0xff; 30]);
+        let first = out.split(|&b| b == b'\n').next().unwrap();
+        assert_eq!(first.len(), 76 + 1);
+        assert!(first.ends_with(b"=FF=\r"));
+    }
+
+    #[test]
+    fn the_length_bound_holds() {
+        for len in 0..200 {
+            for byte in [b'x', b' ', b'\n', 0xff] {
+                for opts in [QuotedPrintableEncodeOptions::default(), BINARY] {
+                    let input = vec![byte; len];
+                    let out = encoded(&input, opts);
+                    assert!(out.len() <= encoded_len_max(len, opts).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_byte_of_room_always_progresses() {
+        let input: Vec<u8> = (0..=255).chain(b"a \r\nb \rc\t".iter().copied()).collect();
+
+        for opts in [QuotedPrintableEncodeOptions::default(), BINARY] {
+            let mut encoder = QuotedPrintableEncode::new(opts);
+            let mut src = &input[..];
+            let mut out = Vec::new();
+            let mut room = [0; 1];
+
+            while !src.is_empty() {
+                let output = encoder.resume(src, &mut room);
+                assert!(output.read > 0 || output.written > 0);
+                out.extend_from_slice(&room[..output.written]);
+                src = &src[output.read..];
+            }
+
+            let mut tail = [0; STEP_MAX];
+            let end = encoder.finish(&mut tail).unwrap();
+            out.extend_from_slice(&tail[..end]);
+            assert_eq!(out, encoded(&input, opts));
+        }
+    }
+
+    #[test]
+    fn a_short_buffer_writes_nothing() {
+        let mut out = [0xaa; 3];
+        let opts = QuotedPrintableEncodeOptions::default();
+        assert_eq!(encode(b"f", &mut out, opts), None);
+        assert_eq!(out, [0xaa; 3]);
+
+        let mut encoder = QuotedPrintableEncode::new(opts);
+        assert_eq!(encoder.resume(b" ", &mut []).read, 1);
+        assert_eq!(encoder.finish(&mut out[..2]), None);
+        assert_eq!(encoder.finish(&mut out), Some(3));
+        assert_eq!(&out, b"=20");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn a_vec_is_appended_to() {
+        let mut out = b"> ".to_vec();
+        encode_vec(b"a=b", &mut out, QuotedPrintableEncodeOptions::default());
+        assert_eq!(out, b"> a=3Db");
+    }
+}

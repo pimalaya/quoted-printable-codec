@@ -1,0 +1,33 @@
+[package]
+name = "quoted-printable-codec"
+description = "Quoted-printable encoder and decoder, no_std and dependency-free"
+version = "0.0.1"
+authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
+rust-version = "1.89"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+categories = ["encoding", "no-std", "no-std::no-alloc", "email"]
+keywords = ["quoted-printable", "mime", "codec", "no-std", "email"]
+homepage = "https://pimalaya.org"
+documentation = "https://docs.rs/quoted-printable-codec/latest/quoted_printable_codec"
+repository = "https://github.com/pimalaya/quoted-printable-codec"
+exclude = ["/cairn"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+alloc = []
+
+[[bench]]
+name = "compare"
+path = "benches/compare.rs"
+harness = false
+required-features = ["alloc"]
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+encodify = "1"
+mail-parser = "0.11"
+quoted_printable = "0.5"
