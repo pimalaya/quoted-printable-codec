@@ -16,7 +16,7 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::{edge::Edge, is_blank, is_plain, mask, window};
+use crate::{edge::Edge, is_blank, is_plain, mask, pad, window};
 
 /// The most trailing spaces and tabs a line break deletes: past them, the
 /// oldest are kept as data, as no well-formed line holds that many.
@@ -49,25 +49,16 @@ const CARRY: usize = BLANKS_MAX + 4;
 /// ```
 ///
 /// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct QuotedPrintableDecode {
     edge: Edge<CARRY, CARRY>,
-    clean: bool,
-}
-
-impl Default for QuotedPrintableDecode {
-    fn default() -> Self {
-        Self::new()
-    }
+    dirty: bool,
 }
 
 impl QuotedPrintableDecode {
     /// Builds a decoder.
     pub fn new() -> Self {
-        Self {
-            edge: Edge::new(),
-            clean: true,
-        }
+        Self::default()
     }
 
     /// Decodes as much of `src` as fits in `dst`.
@@ -76,15 +67,15 @@ impl QuotedPrintableDecode {
     /// next chunk; one byte of room always lets the decoder progress. The
     /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableDecodeOutput {
-        let clean = &mut self.clean;
+        let dirty = &mut self.dirty;
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
-            tokens(&src[..src.len().min(dst.len())], dst, last, clean)
+            tokens(&src[..src.len().min(dst.len())], dst, last, dirty)
         });
 
         QuotedPrintableDecodeOutput {
             read,
             written,
-            clean: self.clean,
+            clean: !self.dirty,
         }
     }
 
@@ -93,16 +84,16 @@ impl QuotedPrintableDecode {
     ///
     /// Returns none, writing nothing, when `dst` is too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
-        let mut clean = self.clean;
+        let mut dirty = self.dirty;
         let written = self
             .edge
-            .finish(dst, |src, dst| tokens(src, dst, true, &mut clean)[1])?;
-        self.clean = clean;
+            .finish(dst, |src, dst| tokens(src, dst, true, &mut dirty)[1])?;
+        self.dirty = dirty;
 
         Some(QuotedPrintableDecodeOutput {
             read: 0,
             written,
-            clean,
+            clean: !dirty,
         })
     }
 }
@@ -121,17 +112,20 @@ pub struct QuotedPrintableDecodeOutput {
 /// Decodes the whole of `src` into `dst`.
 ///
 /// Returns none, writing nothing, when `dst` is shorter than
-/// [`decoded_len_max`] asks. Within that length, the bytes of `dst` past the
-/// ones written may be overwritten.
+/// [`decoded_len_max`] asks. The bytes of `dst` past the ones written may be
+/// overwritten, to its end.
 pub fn decode(src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
-    let dst = dst.get_mut(..decoded_len_max(src.len()))?;
-    let mut clean = true;
-    let [read, written, _] = tokens(src, dst, true, &mut clean);
+    if dst.len() < decoded_len_max(src.len()) {
+        return None;
+    }
+
+    let mut dirty = false;
+    let [read, written, _] = tokens(src, dst, true, &mut dirty);
 
     Some(QuotedPrintableDecodeOutput {
         read,
         written,
-        clean,
+        clean: !dirty,
     })
 }
 
@@ -142,11 +136,9 @@ pub fn decode(src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput>
 pub fn decode_vec(src: &[u8], out: &mut Vec<u8>) -> bool {
     let start = out.len();
     out.resize(start + decoded_len_max(src.len()), 0);
-
-    let mut clean = true;
-    let [_, written, _] = tokens(src, &mut out[start..], true, &mut clean);
-    out.truncate(start + written);
-    clean
+    let output = decode(src, &mut out[start..]).unwrap();
+    out.truncate(start + output.written);
+    output.clean
 }
 
 /// The most bytes [`decode`] writes for an input of `len` bytes, whatever
@@ -162,30 +154,28 @@ pub const fn decoded_len_max(len: usize) -> usize {
 /// break or a CR cut short is left unread, and the spaces and tabs a line
 /// break would delete are held: written past the ones counted, for the
 /// caller to carry.
-fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3] {
+fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3] {
     let mut read = 0;
     let mut written = 0;
     let mut blanks = 0;
     let mut irregular = 0;
+    // NOTE: padded first, so that its stores are done when blocks load them.
+    let mut end = [0; 128];
+    pad(&mut end, src);
 
     loop {
-        if read >= irregular && read < src.len() {
-            match block(&src[read..], &mut dst[written..], blanks > 0, clean) {
-                Ok([r, w, trailing]) => {
-                    read += r;
-                    written += w;
-                    blanks = if trailing == r { blanks + r } else { trailing };
-                    continue;
-                }
-                Err(at) => irregular = read + at + 1,
-            }
+        if read >= irregular && src.len() - read >= 8 {
+            let [r, w] = blocks(&src[read..], &end, &mut dst[written..], &mut blanks, dirty);
+            read += r;
+            written += w;
+            irregular = read + 1;
         }
 
         match src[read..] {
-            [b'=', high, low, ..] if (HEX[high as usize] | HEX[low as usize]) < 0x80 => {
-                let (high, low) = (HEX[high as usize], HEX[low as usize]);
-                *clean &= (high | low) & 0x10 == 0;
-                dst[written] = high << 4 | low & 0xf;
+            [b'=', high, low, ..] if escape(high, low) < 0x8000 => {
+                let value = escape(high, low);
+                *dirty |= value & 0x1000 != 0;
+                dst[written] = value as u8;
                 read += 3;
                 written += 1;
             }
@@ -196,7 +186,9 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3
                     .take_while(|&&byte| is_blank(byte))
                     .count();
 
-                let digit = after.first().is_some_and(|&byte| HEX[byte as usize] < 0x80);
+                let digit = after
+                    .first()
+                    .is_some_and(|&byte| DIGITS[1][byte as usize] < 0x8000);
                 let eol = match after[spaces..] {
                     _ if spaces > BLANKS_MAX => None,
                     [b'\n', ..] => Some(1),
@@ -212,7 +204,7 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3
                 } else {
                     let kept = 1 + digit as usize;
                     dst[written..written + kept].copy_from_slice(&src[read..read + kept]);
-                    *clean = false;
+                    *dirty = true;
                     read += kept;
                     written += kept;
                 }
@@ -225,7 +217,7 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3
                 written += len;
             }
             [b'\r', ref rest @ ..] if last || !rest.is_empty() => {
-                *clean = false;
+                *dirty = true;
                 read += 1;
                 continue;
             }
@@ -236,7 +228,7 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3
             }
             [byte, ..] => {
                 dst[written] = byte;
-                *clean &= is_plain(byte);
+                *dirty |= !is_plain(byte);
                 blanks = if is_blank(byte) { blanks + 1 } else { 0 };
                 read += 1;
                 written += 1;
@@ -248,105 +240,122 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3
     }
 }
 
-/// Decodes the first 32 bytes of `src`, or all of them when fewer, into
-/// `dst`, returning the bytes read, written, and the spaces and tabs that
-/// end them; `blank` tells that a space or tab the next line break would
-/// delete comes before them.
+/// Decodes `src` into `dst`, at least as long, in blocks of 32 bytes, up to
+/// the first byte a block leaves to the token steps or the last 8 bytes,
+/// returning the bytes read and written; `end` holds the end of the input as
+/// [`pad`] copies it, `blanks` counts the spaces and tabs the next line break
+/// would delete, and `dirty` turns true on a byte that is not clean.
 ///
-/// The 2 bytes after them are read ahead, and the bytes read run past them
-/// to the end of an escape or a soft break that starts in them. They hold
-/// only literal bytes, escapes, soft breaks and CRLF or LF with no blank
-/// before them, or the offset of the first other one is returned, and the
-/// token steps decode them instead.
-// NOTE: folded into `tokens`, its loop runs out of registers: 70% slower on
-// escapes.
-fn block(src: &[u8], dst: &mut [u8], blank: bool, clean: &mut bool) -> Result<[usize; 3], usize> {
-    let mut buffer = [0; 64];
-    let w = window(src, &mut buffer);
-    let len = src.len().min(32);
-    let lanes = ((1u64 << len) - 1) as u32;
-    let mut equals = mask(w, |byte| byte == b'=') & lanes;
-    let mut others = !mask(w, is_plain) & !equals & lanes;
-
-    let mut spare = [0; 64];
-    let direct = dst.len() >= 64;
-    let out = if direct {
-        &mut dst[..64]
-    } else {
-        &mut spare[..]
-    };
+/// A block reads the 2 bytes after it ahead, and runs past its end to the end
+/// of an escape or a soft break that starts in it. It decodes literal bytes,
+/// escapes, soft breaks, and CRLF or LF with no blank before them: a
+/// malformed escape, a bare CR or a line break after a blank ends it.
+#[inline(never)]
+fn blocks(
+    src: &[u8],
+    end: &[u8; 128],
+    dst: &mut [u8],
+    blanks: &mut usize,
+    dirty: &mut bool,
+) -> [usize; 2] {
     let mut read = 0;
     let mut written = 0;
-    let mut dirty = 0;
+    let mut flags = 0;
+    let mut spare = [0; 64];
 
-    while equals != 0 {
-        let at = equals.trailing_zeros() as usize;
-        let [high, low] = [w[at + 1], w[at + 2]];
-        let digits = HEX[high as usize] | HEX[low as usize];
-        let escape = digits < 0x80;
+    while src.len() - read >= 8 {
+        let rest = src.len() - read;
+        let w = window(&src[read..], end);
+        let direct = dst.len() - written >= 64;
+        let out = dst[written..].first_chunk_mut().unwrap_or(&mut spare);
+        let mut stop = rest.min(32);
+        let mut events = !mask(w, is_plain) & u32::MAX >> (32 - stop);
+        let mut r = 0;
+        let mut gap = 0;
 
-        if !escape && high != b'\n' && [high, low] != *b"\r\n" {
-            return Err(at);
+        while events != 0 {
+            let at = events.trailing_zeros() as usize;
+            events &= events - 1;
+
+            if w[at] == b'=' {
+                let [high, low] = [w[at + 1], w[at + 2]];
+                let value = escape(high, low);
+                out[(r - gap) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
+
+                if value < 0x8000 {
+                    out[(at - gap) & 63] = value as u8;
+                    flags |= value;
+                    (r, gap) = (at + 3, gap + 2);
+                } else if high == b'\n' {
+                    (r, gap) = (at + 2, gap + 2);
+                } else if [high, low] == *b"\r\n" {
+                    (r, gap) = (at + 3, gap + 3);
+                } else {
+                    (r, stop) = (at, at);
+                    break;
+                }
+            } else if at < r {
+            } else if matches!(w[at], b'\r' | b'\n') {
+                let blank = at.checked_sub(1).map_or(*blanks > 0, |at| is_blank(w[at]));
+
+                if blank || w[at] == b'\r' && w[at + 1] != b'\n' {
+                    stop = at;
+                    break;
+                }
+            } else {
+                flags |= 0x1000;
+            }
         }
 
-        out[written & 31..][..32].copy_from_slice(&w[read & 31..][..32]);
-        written += at - read;
-        out[written & 63] = HEX[high as usize] << 4 | HEX[low as usize] & 0xf;
-        written += escape as usize;
-        dirty |= digits & (escape as u8) << 4;
-        read = at + 2 + (escape | (high == b'\r')) as usize;
-        equals &= equals - 1;
-    }
-
-    while others != 0 {
-        let at = others.trailing_zeros() as usize;
-        let before = if at > 0 {
-            w[at - 1]
-        } else {
-            blank as u8 * b' '
-        };
-        let soft = before == b'=' || at > 1 && w[at - 2..at] == *b"=\r";
-
-        match w[at] {
-            b'\r' | b'\n' if soft => (),
-            b'\r' if w[at + 1] != b'\n' => return Err(at),
-            b'\r' | b'\n' if is_blank(before) => return Err(at),
-            b'\r' | b'\n' => (),
-            _ => dirty |= 1,
+        if r < stop {
+            out[(r - gap) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
+            r = stop;
         }
 
-        others &= others - 1;
+        let n = r - gap;
+
+        if !direct {
+            dst[written..written + n].copy_from_slice(&spare[..n]);
+        }
+
+        let trailing = w[..r]
+            .iter()
+            .rev()
+            .take_while(|&&byte| is_blank(byte))
+            .count();
+        *blanks = if trailing == r { *blanks + r } else { trailing };
+        read += r;
+        written += n;
+
+        if stop < rest.min(32) {
+            break;
+        }
     }
 
-    if read < len {
-        out[written & 31..][..32].copy_from_slice(&w[read..][..32]);
-        written += len - read;
-        read = len;
-    }
-
-    if !direct {
-        let len = dst.len();
-        dst.copy_from_slice(&spare[..len]);
-    }
-
-    *clean &= dirty == 0;
-    let trailing = w[..len]
-        .iter()
-        .rev()
-        .take_while(|&&byte| is_blank(byte))
-        .count();
-    Ok([read, written, trailing])
+    *dirty |= flags & 0x1000 != 0;
+    [read, written]
 }
 
-/// The value of each byte as a hex digit, 0x10 added to a lowercase one, or
-/// 0x80 for any other byte.
-static HEX: [u8; 256] = {
-    let mut table = [0x80; 256];
+/// The byte the escape `=` `high` `low` stands for, 0x1000 added when a
+/// digit is lowercase, or 0x8000 or more when either is no hex digit.
+fn escape(high: u8, low: u8) -> u16 {
+    DIGITS[0][high as usize] | DIGITS[1][low as usize]
+}
+
+/// The value of each byte as the high and the low hex digit of an escape, as
+/// [`escape`] returns it.
+static DIGITS: [[u16; 256]; 2] = {
+    let mut table = [[0x8000; 256]; 2];
     let mut digit = 0;
 
-    while digit < 16 {
-        table[b"0123456789ABCDEF"[digit] as usize] = digit as u8;
-        table[b"0123456789abcdef"[digit] as usize] = digit as u8 | (digit as u8 / 10) << 4;
+    while digit < 22 {
+        let byte = b"0123456789ABCDEFabcdef"[digit] as usize;
+        let [value, flag] = [
+            digit as u16 % 16 + digit as u16 / 16 * 10,
+            (digit as u16 / 16) << 12,
+        ];
+        table[0][byte] = value << 4 | flag;
+        table[1][byte] = value | flag;
         digit += 1;
     }
 

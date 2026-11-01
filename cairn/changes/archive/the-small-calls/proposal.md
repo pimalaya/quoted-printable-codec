@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: the-small-calls
-status: draft
+status: landed
 created: 2026-11-01
 ---
 

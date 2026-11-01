@@ -16,7 +16,7 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::{edge::Edge, is_blank, is_plain, mask, window};
+use crate::{edge::Edge, is_blank, is_plain, mask, pad, window};
 
 /// The most characters a line holds before its soft break `=`.
 const LINE: usize = 75;
@@ -24,12 +24,6 @@ const LINE: usize = 75;
 /// The most output bytes a block touches: 32 escapes, two soft breaks, and a
 /// run copied whole past them.
 const ROOM: usize = 3 * 32 + 6 + 32;
-
-/// The input the encoder carries: a block.
-const CARRY: usize = 32;
-
-/// The output the encoder queues: what a block touches.
-const QUEUE: usize = ROOM;
 
 /// I/O-free quoted-printable encoder, resumed with the caller's input and
 /// output buffers.
@@ -57,7 +51,8 @@ const QUEUE: usize = ROOM;
 pub struct QuotedPrintableEncode {
     opts: QuotedPrintableEncodeOptions,
     column: usize,
-    edge: Edge<CARRY, QUEUE>,
+    // NOTE: carries a block, queues what a block touches.
+    edge: Edge<32, ROOM>,
 }
 
 impl QuotedPrintableEncode {
@@ -66,7 +61,7 @@ impl QuotedPrintableEncode {
         Self {
             opts,
             column: 0,
-            edge: Edge::new(),
+            edge: Edge::default(),
         }
     }
 
@@ -78,8 +73,7 @@ impl QuotedPrintableEncode {
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableEncodeOutput {
         let (opts, column) = (self.opts, &mut self.column);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
-            let [read, written] = blocks(src, dst, last, opts, column);
-            [read, written, 0]
+            blocks(src, dst, last, opts, column)
         });
 
         QuotedPrintableEncodeOutput { read, written }
@@ -92,11 +86,9 @@ impl QuotedPrintableEncode {
     /// too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
         let mut column = self.column;
-        let written = self.edge.finish(dst, |src, dst| {
+        self.edge.finish(dst, |src, dst| {
             blocks(src, dst, true, self.opts, &mut column)[1]
-        })?;
-        self.column = column;
-        Some(written)
+        })
     }
 }
 
@@ -122,11 +114,12 @@ pub enum QuotedPrintableEol {
 }
 
 impl QuotedPrintableEol {
-    /// The soft line break: `=` and the line ending.
-    const fn soft_break(self) -> &'static [u8] {
+    /// The soft line break, `=` and the line ending, padded to 4 bytes, and
+    /// its length.
+    const fn soft_break(self) -> ([u8; 4], usize) {
         match self {
-            Self::Crlf => b"=\r\n",
-            Self::Lf => b"=\n",
+            Self::Crlf => (*b"=\r\n\0", 3),
+            Self::Lf => (*b"=\n\0\0", 2),
         }
     }
 }
@@ -147,9 +140,17 @@ pub struct QuotedPrintableEncodeOutput {
 /// ones written may be overwritten.
 pub fn encode(src: &[u8], dst: &mut [u8], opts: QuotedPrintableEncodeOptions) -> Option<usize> {
     let dst = dst.get_mut(..encoded_len_max(src.len(), opts)?)?;
-    let mut encoder = QuotedPrintableEncode::new(opts);
-    let written = encoder.resume(src, dst).written;
-    Some(written + encoder.finish(&mut dst[written..])?)
+    let mut column = 0;
+    let [read, written, _] = blocks(src, dst, true, opts, &mut column);
+
+    if read == src.len() {
+        return Some(written);
+    }
+
+    let mut spare = [0; 2 * ROOM];
+    let [_, rest, _] = blocks(&src[read..], &mut spare, true, opts, &mut column);
+    dst[written..written + rest].copy_from_slice(&spare[..rest]);
+    Some(written + rest)
 }
 
 /// Encodes the whole of `src` at the end of `out`.
@@ -172,12 +173,13 @@ pub fn encode_vec(src: &[u8], out: &mut Vec<u8>, opts: QuotedPrintableEncodeOpti
 /// Every byte takes at most three characters, and a soft break follows at
 /// least 73 characters, so at least 25 input bytes.
 pub fn encoded_len_max(len: usize, opts: QuotedPrintableEncodeOptions) -> Option<usize> {
-    let breaks = (len / 25 + 1).checked_mul(opts.eol.soft_break().len())?;
+    let breaks = (len / 25 + 1).checked_mul(opts.eol.soft_break().1)?;
     len.checked_mul(3)?.checked_add(breaks)
 }
 
 /// Encodes `src` into `dst` from `column` in blocks of 32 bytes, as many as
-/// fit, returning the bytes read and written.
+/// fit, returning the bytes read and written, and none held, as [`Edge`]
+/// asks.
 ///
 /// Each block reads the 2 bytes after it ahead. Unless `last` tells that the
 /// input ends with `src`, a space, tab or CR that may end a line is left
@@ -188,22 +190,21 @@ fn blocks(
     last: bool,
     opts: QuotedPrintableEncodeOptions,
     column: &mut usize,
-) -> [usize; 2] {
+) -> [usize; 3] {
     let text = !opts.binary;
-    let soft = opts.eol.soft_break();
-    let mut soft_word = [0; 4];
-    soft_word[..soft.len()].copy_from_slice(soft);
-    let eol = u32::from_le_bytes(soft_word) >> 8;
+    let (soft, soft_len) = opts.eol.soft_break();
+    // NOTE: padded first, so that its stores are done when blocks load them.
+    let mut end = [0; 128];
+    pad(&mut end, src);
 
     let mut read = 0;
     let mut written = 0;
     let mut col = *column;
 
-    while let Some(out) = dst.get_mut(written..written + ROOM) {
-        let src = &src[read..];
-        let mut buffer = [0; 64];
-        let w = window(src, &mut buffer);
-        let mut cut = src.len().min(34);
+    while let Some(out) = dst[written..].first_chunk_mut::<ROOM>() {
+        let rest = src.len() - read;
+        let w = window(&src[read..], &end);
+        let mut cut = rest.min(34);
 
         if !last && text && w[..cut].ends_with(b"\r") {
             cut -= 1;
@@ -220,8 +221,8 @@ fn blocks(
         }
 
         let breaks = |at: usize| text && (w[at] == b'\n' || w[at..].starts_with(b"\r\n"));
-        let end = if src.len() > len { breaks(len) } else { last };
-        let mut events = !mask(w, is_plain) & ((1u64 << len) - 1) as u32;
+        let end = if rest > len { breaks(len) } else { last };
+        let mut events = !mask(w, is_plain) & u32::MAX >> (32 - len);
 
         if end && is_blank(w[len - 1]) {
             events |= 1 << (len - 1);
@@ -248,8 +249,8 @@ fn blocks(
             if col + run > LINE {
                 let first = LINE - col;
                 out[n..][..32].copy_from_slice(&w[from..][..32]);
-                out[n + first..][..4].copy_from_slice(&soft_word);
-                n += first + soft.len();
+                out[n + first..][..4].copy_from_slice(&soft);
+                n += first + soft_len;
                 from += first;
                 run -= first;
                 col = 0;
@@ -263,28 +264,22 @@ fn blocks(
                 break;
             }
 
-            let lf = line && w[at] == b'\n';
-            let width = if line { 0 } else { 3 };
+            if !line {
+                if col > LINE - 3 {
+                    out[n..][..4].copy_from_slice(&soft);
+                    n += soft_len;
+                    col = 0;
+                }
 
-            if col + width > LINE {
-                out[n..][..4].copy_from_slice(&soft_word);
-                n += soft.len();
+                out[n..][..4].copy_from_slice(&ESCAPES[w[at] as usize]);
+                n += 3;
+                col += 3;
+            } else if w[at] == b'\n' {
+                out[n..][..3].copy_from_slice(&soft[1..]);
+                n += soft_len - 1;
                 col = 0;
             }
 
-            let word = if lf {
-                eol
-            } else if line {
-                0
-            } else {
-                let digits = b"0123456789ABCDEF";
-                let [high, low] = [w[at] >> 4, w[at] & 0xf].map(|nibble| digits[nibble as usize]);
-                u32::from_le_bytes([b'=', high, low, 0])
-            };
-
-            out[n..][..4].copy_from_slice(&word.to_le_bytes());
-            n += if lf { soft.len() - 1 } else { width };
-            col = if lf { 0 } else { col + width };
             from = at + 1;
             events &= events - 1;
         }
@@ -294,8 +289,22 @@ fn blocks(
     }
 
     *column = col;
-    [read, written]
+    [read, written, 0]
 }
+
+/// The escape of each byte: `=` and two uppercase hex digits.
+static ESCAPES: [[u8; 4]; 256] = {
+    let mut table = [[0; 4]; 256];
+    let mut byte = 0;
+
+    while byte < 256 {
+        let digits = b"0123456789ABCDEF";
+        table[byte] = [b'=', digits[byte >> 4], digits[byte & 0xf], 0];
+        byte += 1;
+    }
+
+    table
+};
 
 #[cfg(test)]
 mod tests {
@@ -396,7 +405,7 @@ mod tests {
                 src = &src[output.read..];
             }
 
-            let mut tail = [0; QUEUE];
+            let mut tail = [0; ROOM];
             let end = encoder.finish(&mut tail).unwrap();
             out.extend_from_slice(&tail[..end]);
             assert_eq!(out, encoded(&input, opts));

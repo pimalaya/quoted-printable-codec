@@ -16,8 +16,8 @@ pub(crate) struct Edge<const C: usize, const Q: usize> {
     end: usize,
 }
 
-impl<const C: usize, const Q: usize> Edge<C, Q> {
-    pub(crate) const fn new() -> Self {
+impl<const C: usize, const Q: usize> Default for Edge<C, Q> {
+    fn default() -> Self {
         Self {
             carry: [0; C],
             carry_len: 0,
@@ -26,7 +26,9 @@ impl<const C: usize, const Q: usize> Edge<C, Q> {
             end: 0,
         }
     }
+}
 
+impl<const C: usize, const Q: usize> Edge<C, Q> {
     /// Runs `core` over `src` into `dst`, returning the bytes read and
     /// written.
     ///
@@ -99,7 +101,7 @@ impl<const C: usize, const Q: usize> Edge<C, Q> {
 
         dst[..queued].copy_from_slice(&self.queue[self.start..self.end]);
         dst[queued..].copy_from_slice(&tail[..w]);
-        *self = Self::new();
+        *self = Self::default();
         Some(queued + w)
     }
 }

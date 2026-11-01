@@ -15,9 +15,10 @@
 //! only: escapes, soft and hard line breaks, each literal run between them
 //! copied whole. The decoder leaves to token steps, byte by byte, what a
 //! block does not decide alone: malformed escapes, bare CRs, blanks before a
-//! line break and the end of the input. The coroutines run the blocks
-//! straight between the caller's buffers, and keep only the few bytes they
-//! cannot decide yet, or have no room for, between two calls.
+//! line break and the end of the input. A block reads the last bytes of an
+//! input from a padded copy of them. The coroutines run the blocks straight
+//! between the caller's buffers, and keep only the few bytes they cannot
+//! decide yet, or have no room for, between two calls.
 //!
 //! ```
 //! use quoted_printable_codec::{
@@ -66,27 +67,33 @@ const fn is_blank(byte: u8) -> bool {
 /// The lanes of `bytes` in `class`, a bit each, in a shape compilers turn
 /// into vector compares.
 #[inline(never)]
-fn mask(bytes: &[u8], class: impl Fn(u8) -> bool) -> u32 {
-    // NOTE: compilers vectorize a fold of 16 lanes, not one of 32.
-    let half = |bytes: &[u8]| (0..16).fold(0, |mask, i| mask | (class(bytes[i]) as u32) << i);
-    half(&bytes[..16]) | half(&bytes[16..32]) << 16
+fn mask(bytes: &[u8; 64], class: impl Fn(u8) -> bool) -> u32 {
+    let (halves, _) = bytes.as_chunks();
+    half(&halves[0], &class) | half(&halves[1], &class) << 16
 }
 
-/// The first 64 bytes of `src`, padded into `buffer` when fewer, for a block
-/// to read its 32 bytes, the 2 after them, and runs copied out whole.
-///
-/// NOTE: reading `src` itself spares the stall of reading a buffer just
-/// written at other offsets.
-fn window<'a>(src: &'a [u8], buffer: &'a mut [u8; 64]) -> &'a [u8] {
-    if let Some(src) = src.get(..64) {
-        return src;
-    }
+/// NOTE: compilers vectorize a fold of 16 lanes, not one of 32.
+#[inline(always)]
+fn half(bytes: &[u8; 16], class: &impl Fn(u8) -> bool) -> u32 {
+    let lanes = bytes.iter().enumerate();
+    lanes.fold(0, |mask, (i, &byte)| mask | (class(byte) as u32) << i)
+}
 
-    for (buffer, src) in buffer.chunks_mut(16).zip(src.chunks(16)) {
-        buffer[..src.len()].copy_from_slice(src);
+/// Copies the last 64 bytes of `src`, or all of them when fewer, to end at
+/// offset 64 of `out`, zeros after them, for blocks to read the end of an
+/// input 64 bytes at a time.
+fn pad(out: &mut [u8; 128], src: &[u8]) {
+    match src.last_chunk::<64>() {
+        Some(last) => out[..64].copy_from_slice(last),
+        None => out[64 - src.len()..64].copy_from_slice(src),
     }
+}
 
-    buffer
+/// The 64 bytes a block at the start of `src` reads, from `end` as [`pad`]
+/// fills it when fewer remain.
+fn window<'a>(src: &'a [u8], end: &'a [u8; 128]) -> &'a [u8; 64] {
+    src.first_chunk()
+        .unwrap_or_else(|| end[64 - src.len()..].first_chunk().unwrap())
 }
 
 #[cfg(test)]
