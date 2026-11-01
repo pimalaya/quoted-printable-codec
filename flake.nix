@@ -1,5 +1,5 @@
 {
-  description = "Quoted-printable encoder and decoder, no_std and dependency-free, for Rust";
+  description = "Quoted-printable encoder and decoder with SIMD and no_std, for Rust";
 
   inputs = {
     nixpkgs = {

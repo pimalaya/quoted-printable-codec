@@ -6,7 +6,7 @@ status: current
 
 # Calls
 
-How encoding and decoding are called: from one `QuotedPrintableCodec` value, I/O-free, over the caller's buffers, at once through its one-shot methods, which run the same blocks, or chunk by chunk through the `QuotedPrintableEncode` and `QuotedPrintableDecode` built from it, with no dependency and no allocation outside the `alloc` helpers; the backend its token names is in the backends capability.
+How encoding and decoding are called: from one `QuotedPrintableCodec` value, I/O-free, over the caller's buffers, at once through its one-shot methods, which run the same blocks, or chunk by chunk through the `QuotedPrintableEncode` and `QuotedPrintableDecode` built from it, with simd-cpu as its one dependency and no allocation outside the `alloc` helpers; the backend its token names is in the backends capability.
 
 ### Requirement: Lengths and short buffers
 
@@ -21,9 +21,9 @@ How encoding and decoding are called: from one `QuotedPrintableCodec` value, I/O
 - WHEN each takes another input and finishes again
 - THEN each gives what a new one gives: the encoder breaks lines from column 0, and the decoder reports the second input clean when it is
 
-### Requirement: No dependency, no std
+### Requirement: One dependency, no std
 
-The library SHALL build `#![no_std]` with no dependency under every feature combination, `std` serving only `QuotedPrintableCpu::detect` and `alloc` only `QuotedPrintableCodec::encode_vec` and `QuotedPrintableCodec::decode_vec`. Unsafe code SHALL serve only the AVX-512 backend: its loads and stores, the calls into it a token allows, and `QuotedPrintableCpu::assume`.
+The library SHALL build `#![no_std]` under every feature combination with simd-cpu, without its `std` feature, as its only dependency, `alloc` serving only `QuotedPrintableCodec::encode_vec` and `QuotedPrintableCodec::decode_vec`. Unsafe code SHALL serve only the AVX-512 backend: its loads and stores and the calls into it a token allows.
 
 ### Requirement: One codec for every call
 

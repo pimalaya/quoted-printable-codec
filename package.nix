@@ -25,7 +25,7 @@ rustPlatform.buildRustPackage {
   };
 
   meta = {
-    description = "Quoted-printable encoder and decoder, no_std and dependency-free";
+    description = "Quoted-printable encoder and decoder with SIMD and no_std";
     homepage = "https://github.com/pimalaya/quoted-printable-codec";
     changelog = "https://github.com/pimalaya/quoted-printable-codec/blob/master/CHANGELOG.md";
     license = [

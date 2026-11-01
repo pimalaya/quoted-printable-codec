@@ -1,6 +1,6 @@
 # 🔣 quoted-printable-codec [![Matrix](https://img.shields.io/badge/chat-%23pimalaya-blue?style=flat&logo=matrix&logoColor=white)](https://matrix.to/#/#pimalaya:matrix.org) [![Mastodon](https://img.shields.io/badge/news-%40pimalaya-blue?style=flat&logo=mastodon&logoColor=white)](https://fosstodon.org/@pimalaya) [![Sponsor](https://img.shields.io/badge/sponsor-pink?style=flat&logo=github-sponsors&logoColor=white)](https://pimalaya.org/sponsor/)
 
-Quoted-printable encoder and decoder, no_std and dependency-free
+Quoted-printable encoder and decoder with SIMD and no_std
 
 ## Table of contents
 
@@ -22,7 +22,7 @@ Quoted-printable encoder and decoder, no_std and dependency-free
 - **Text and binary**: text mode keeps line breaks as hard breaks, binary mode escapes CR and LF like any other byte.
 - **Lenient decoding**: never fails, follows the robust rules of RFC 2045 (lowercase digits, trailing blanks, bare CRs, malformed escapes kept), and reports whether the input was clean.
 - **I/O-free**: encode and decode chunk by chunk into your own buffers.
-- **Portable**: no_std, dependency-free; unsafe code only in the AVX-512 backend, and the portable one vectorized by the compiler for any target.
+- **Portable**: no_std, the CPU features detected once by the application through [simd-cpu](https://github.com/pimalaya/simd-cpu), the only dependency; unsafe code only in the AVX-512 backend, and the portable one vectorized by the compiler for any target.
 
 ## RFC coverage
 
@@ -42,7 +42,7 @@ The crate ships no examples folder, a whole program adding nothing to a two-call
 
 ## Benchmarks
 
-[criterion](https://crates.io/crates/criterion) medians of `cargo bench --features std --bench compare` on 2026-11-01, on an AMD Ryzen AI Max+ 395 (Zen 5), in GiB/s of raw bytes. Each italic delta compares its row with quoted-printable-codec.
+[criterion](https://crates.io/crates/criterion) medians of `cargo bench --bench compare` on 2026-11-01, on an AMD Ryzen AI Max+ 395 (Zen 5), in GiB/s of raw bytes. Each italic delta compares its row with quoted-printable-codec.
 
 ### ASCII decoding
 
@@ -97,7 +97,7 @@ The crate ships no examples folder, a whole program adding nothing to a two-call
 
 ### Reading the numbers
 
-- quoted-printable-codec runs its AVX-512 backend here, as `QuotedPrintableCpu::detect` picks it; on a CPU without AVX-512 VBMI2, its portable backend runs, whose cycle counts are in [benches/README.md](./benches/README.md).
+- quoted-printable-codec runs its AVX-512 backend here, as `QuotedPrintableCpu::new(SimdCpu::detect())` picks it; on a CPU without AVX-512 VBMI2, its portable backend runs, whose cycle counts are in [benches/README.md](./benches/README.md).
 - ASCII is lowercase words with a few `.`, `,` and `=` in CRLF lines of about 72 characters; accented is the same with about one character in seven a two-byte UTF-8 letter; binary is pseudo-random bytes, encoded in binary mode. Decoding reads quoted-printable-codec's encoding of each, and every decoder gives back the raw bytes.
 - quoted_printable and mail-parser allocate their output, as their APIs ask; mail-parser only decodes.
 - Each cell is the median of three runs: quoted-printable-codec's 64 B and 4 KiB cells moved by up to 10% between runs, the memory-bound 1 MiB and 10 MiB ones by up to 30%.

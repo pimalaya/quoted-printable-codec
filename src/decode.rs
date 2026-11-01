@@ -376,6 +376,8 @@ static DIGITS: [[u16; 256]; 2] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
+    use simd_cpu::SimdCpu;
+
     use crate::{
         codec::QuotedPrintableEol,
         cpu::{QuotedPrintableCpu, available},
@@ -383,7 +385,7 @@ mod tests {
     };
 
     const CODEC: QuotedPrintableCodec = QuotedPrintableCodec {
-        cpu: QuotedPrintableCpu::BASELINE,
+        cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
         binary: false,
     };

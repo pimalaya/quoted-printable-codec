@@ -1,15 +1,16 @@
 //! # quoted-printable-codec
 //!
 //! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7),
-//! lenient as mail needs it, with SIMD, `no_std`, no dependency and no I/O.
+//! lenient as mail needs it, with SIMD, `no_std` and no I/O.
 //!
 //! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
-//! a [`QuotedPrintableCpu`] backend token, which the application gets once,
-//! usually from `QuotedPrintableCpu::detect`, the mode, text or binary, and
-//! the line ending of encoded output. Its one-shot methods take a whole
-//! input at once. [`QuotedPrintableEncode`] and [`QuotedPrintableDecode`],
-//! from [`encode`] and [`decode`], take a codec, then the caller's input and
-//! output buffers chunk by chunk, as any I/O-free coroutine does.
+//! a [`QuotedPrintableCpu`] backend token, picked from the `simd_cpu::SimdCpu`
+//! the application gets once, usually from `SimdCpu::detect`, the mode, text
+//! or binary, and the line ending of encoded output. Its one-shot methods
+//! take a whole input at once. [`QuotedPrintableEncode`] and
+//! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
+//! then the caller's input and output buffers chunk by chunk, as any I/O-free
+//! coroutine does.
 //!
 //! The portable backend reads blocks of 32 bytes in safe code the compiler
 //! vectorizes on any target: a block takes a bitmask of its special bytes
@@ -27,10 +28,11 @@
 //!     codec::{QuotedPrintableCodec, QuotedPrintableEol},
 //!     cpu::QuotedPrintableCpu,
 //! };
+//! use simd_cpu::SimdCpu;
 //!
 //! let input = "Grüße,\nJürgen\n".as_bytes();
 //! let codec = QuotedPrintableCodec {
-//!     cpu: QuotedPrintableCpu::BASELINE,
+//!     cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
 //!     eol: QuotedPrintableEol::Crlf,
 //!     binary: false,
 //! };
@@ -57,7 +59,7 @@
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
-#[cfg(any(feature = "std", test))]
+#[cfg(test)]
 extern crate std;
 
 #[cfg(target_arch = "x86_64")]

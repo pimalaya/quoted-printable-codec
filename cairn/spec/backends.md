@@ -10,7 +10,7 @@ Every call runs the backend the `QuotedPrintableCpu` token of its codec names: p
 
 ### Requirement: CPU detection is the caller's
 
-No encoding or decoding function SHALL detect CPU features. A backend SHALL run only from a `QuotedPrintableCpu` token: `BASELINE`, the best backend the build target guarantees through `cfg(target_feature)`; `assume`, unsafe; or `detect`, behind the `std` feature.
+No encoding or decoding function SHALL detect CPU features. A backend SHALL run only from a `QuotedPrintableCpu` that `QuotedPrintableCpu::new` built from a `simd_cpu::SimdCpu`, the application's token of the features the running CPU has.
 
 #### Scenario: A default x86_64 build without std
 - GIVEN the crate built for x86_64 with no feature and no `-C target-feature`
@@ -19,12 +19,12 @@ No encoding or decoding function SHALL detect CPU features. A backend SHALL run 
 
 ### Requirement: The widest backend the CPU has
 
-`QuotedPrintableCpu::detect` SHALL name the AVX-512 backend when the running CPU has AVX-512 VBMI and VBMI2, BMI1, BMI2, LZCNT and POPCNT, and the portable one otherwise; `QuotedPrintableCpu::BASELINE` SHALL name the AVX-512 backend only when the build target's features guarantee all of them.
+`QuotedPrintableCpu::new` SHALL name the AVX-512 backend when its `SimdCpu` holds AVX-512 VBMI and VBMI2, BMI1, BMI2, LZCNT and POPCNT, and the portable one otherwise.
 
 #### Scenario: A CPU with AVX-512 VBMI2
-- GIVEN an x86_64 CPU with AVX-512 VBMI2, such as Zen 4 and later or Ice Lake and later
-- WHEN the application calls `QuotedPrintableCpu::detect`
-- THEN the token names the AVX-512 backend
+- GIVEN a `SimdCpu` detected on an x86_64 CPU with AVX-512 VBMI2, such as Zen 4 and later or Ice Lake and later
+- WHEN the application builds a `QuotedPrintableCpu` from it
+- THEN the token names the AVX-512 backend, and from `SimdCpu::NONE` the portable one
 
 ### Requirement: Every backend matches the portable one
 

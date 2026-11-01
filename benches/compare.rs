@@ -10,13 +10,14 @@ use quoted_printable_codec::{
     codec::{QuotedPrintableCodec, QuotedPrintableEol},
     cpu::QuotedPrintableCpu,
 };
+use simd_cpu::SimdCpu;
 
 const SIZES: [usize; 4] = [64, 4 * 1024, 1024 * 1024, 10 * 1024 * 1024];
 
 /// The codec of a body, with the best backend the CPU has.
 fn codec(binary: bool) -> QuotedPrintableCodec {
     QuotedPrintableCodec {
-        cpu: QuotedPrintableCpu::detect(),
+        cpu: QuotedPrintableCpu::new(SimdCpu::detect()),
         eol: QuotedPrintableEol::Crlf,
         binary,
     }

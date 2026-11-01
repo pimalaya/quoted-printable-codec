@@ -3,7 +3,7 @@ cairn: tasks
 change: the-wider-reach
 ---
 
-- [ ] The shared token: `simd_cpu::SimdCpu` in place of `QuotedPrintableCpu`, as base64-codec did (the change a-shared-cpu-token)
+- [x] The shared token: `simd_cpu::SimdCpu` in place of `QuotedPrintableCpu`, as base64-codec did (the change a-shared-cpu-token)
 - [ ] Rebuild the measuring harnesses (perf in both builds, both backends, before/after, fuzz per backend) as the proposal describes
 - [ ] AVX2 backend: decoding and encoding ahead of the portable rows, its lines weighed against the gain
 - [ ] NEON backend, and an aarch64 build and measure of the portable one

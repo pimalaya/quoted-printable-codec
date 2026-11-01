@@ -1,6 +1,6 @@
 [package]
 name = "quoted-printable-codec"
-description = "Quoted-printable encoder and decoder, no_std and dependency-free"
+description = "Quoted-printable encoder and decoder with SIMD and no_std"
 version = "0.0.1"
 authors = ["Clément DOUIN (soywod) <pimalaya.org@posteo.net>"]
 rust-version = "1.89"
@@ -19,16 +19,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 alloc = []
-std = ["alloc"]
 
 [[bench]]
 name = "compare"
 path = "benches/compare.rs"
 harness = false
-required-features = ["std"]
+
+[dependencies]
+simd-cpu = { version = "0.0.1", git = "https://github.com/pimalaya/simd-cpu", rev = "4cde2e904ec6edd841215dd5111213325899e11a" }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 encodify = "1"
 mail-parser = "0.11"
 quoted_printable = "0.5"
+simd-cpu = { version = "0.0.1", git = "https://github.com/pimalaya/simd-cpu", rev = "4cde2e904ec6edd841215dd5111213325899e11a", features = ["std"] }

@@ -1,8 +1,11 @@
 //! # CPU token
 //!
 //! [`QuotedPrintableCpu`], the backend a
-//! [`QuotedPrintableCodec`](crate::codec::QuotedPrintableCodec) runs: the
-//! application picks it, the library never detects CPU features.
+//! [`QuotedPrintableCodec`](crate::codec::QuotedPrintableCodec) runs, picked
+//! from the [`SimdCpu`] the application hands over: the library never detects
+//! CPU features.
+
+use simd_cpu::SimdCpu;
 
 /// The backend a codec runs, by construction one the running CPU supports.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -11,37 +14,12 @@ pub struct QuotedPrintableCpu {
 }
 
 impl QuotedPrintableCpu {
-    /// The best backend the build's target features guarantee: portable on
-    /// a default build.
-    pub const BASELINE: Self = Self {
-        backend: match AVX512 {
-            #[cfg(target_arch = "x86_64")]
-            true => QuotedPrintableBackend::Avx512,
-            _ => QuotedPrintableBackend::Portable,
-        },
-    };
-
-    /// Names `backend` without checking the running CPU.
-    ///
-    /// # Safety
-    ///
-    /// The running CPU must support the instructions of `backend`.
-    pub const unsafe fn assume(backend: QuotedPrintableBackend) -> Self {
-        Self { backend }
-    }
-
-    /// The best backend the running CPU supports, detected at run time.
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn detect() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        if detect_avx512() {
-            return Self {
-                backend: QuotedPrintableBackend::Avx512,
-            };
+    /// The AVX-512 backend when `cpu` has AVX-512 VBMI and VBMI2, BMI1, BMI2,
+    /// LZCNT and POPCNT, the portable one otherwise.
+    pub const fn new(cpu: SimdCpu) -> Self {
+        Self {
+            backend: widest(cpu),
         }
-
-        Self::BASELINE
     }
 
     /// The backend this token names.
@@ -51,6 +29,7 @@ impl QuotedPrintableCpu {
 
     /// Whether the AVX-512 blocks encode `src`: on their backend, unless the
     /// input is short with few bytes to escape.
+    #[cfg_attr(not(target_arch = "x86_64"), expect(unused_variables))]
     pub(crate) fn wide(self, src: &[u8]) -> bool {
         match self.backend {
             #[cfg(target_arch = "x86_64")]
@@ -63,7 +42,7 @@ impl QuotedPrintableCpu {
 
 impl Default for QuotedPrintableCpu {
     fn default() -> Self {
-        Self::BASELINE
+        const { Self::new(SimdCpu::BASELINE) }
     }
 }
 
@@ -78,40 +57,37 @@ pub enum QuotedPrintableBackend {
     Avx512,
 }
 
-/// Whether the build target guarantees what the AVX-512 backend runs.
-const AVX512: bool = cfg!(all(
-    target_feature = "avx512vbmi2",
-    target_feature = "avx512vbmi",
-    target_feature = "bmi1",
-    target_feature = "bmi2",
-    target_feature = "lzcnt",
-    target_feature = "popcnt",
-));
+#[cfg(target_arch = "x86_64")]
+const fn widest(cpu: SimdCpu) -> QuotedPrintableBackend {
+    use simd_cpu::SimdFeature::{Avx512Vbmi, Avx512Vbmi2, Bmi1, Bmi2, Lzcnt, Popcnt};
 
-#[cfg(all(target_arch = "x86_64", any(feature = "std", test)))]
-fn detect_avx512() -> bool {
-    use std::arch::is_x86_feature_detected as has;
-
-    has!("avx512vbmi2")
-        && has!("avx512vbmi")
-        && has!("bmi1")
-        && has!("bmi2")
-        && has!("lzcnt")
-        && has!("popcnt")
+    if cpu.has(Avx512Vbmi2)
+        && cpu.has(Avx512Vbmi)
+        && cpu.has(Bmi1)
+        && cpu.has(Bmi2)
+        && cpu.has(Lzcnt)
+        && cpu.has(Popcnt)
+    {
+        QuotedPrintableBackend::Avx512
+    } else {
+        QuotedPrintableBackend::Portable
+    }
 }
 
-/// The backends the running CPU supports.
+#[cfg(not(target_arch = "x86_64"))]
+const fn widest(_: SimdCpu) -> QuotedPrintableBackend {
+    QuotedPrintableBackend::Portable
+}
+
+/// The backends the running CPU supports, portable first.
 #[cfg(test)]
 pub(crate) fn available() -> alloc::vec::Vec<QuotedPrintableCpu> {
-    let mut cpus = alloc::vec![QuotedPrintableCpu {
-        backend: QuotedPrintableBackend::Portable,
-    }];
+    let portable = QuotedPrintableCpu::new(SimdCpu::NONE);
+    let detected = QuotedPrintableCpu::new(SimdCpu::detect());
+    let mut cpus = alloc::vec![portable];
 
-    #[cfg(target_arch = "x86_64")]
-    if detect_avx512() {
-        cpus.push(QuotedPrintableCpu {
-            backend: QuotedPrintableBackend::Avx512,
-        });
+    if detected != portable {
+        cpus.push(detected);
     }
 
     cpus

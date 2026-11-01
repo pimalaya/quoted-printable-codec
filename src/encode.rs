@@ -295,6 +295,8 @@ static ESCAPES: [[u8; 4]; 256] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
+    use simd_cpu::SimdCpu;
+
     use crate::{
         codec::QuotedPrintableEol,
         cpu::{QuotedPrintableCpu, available},
@@ -302,7 +304,7 @@ mod tests {
     };
 
     const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
-        cpu: QuotedPrintableCpu::BASELINE,
+        cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
         binary: false,
     };
