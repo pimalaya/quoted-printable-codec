@@ -4,10 +4,12 @@
 //! lenient as mail needs it, `no_std`, with no dependency, no I/O and no
 //! unsafe code.
 //!
-//! [`encode`] and [`decode`] hold the API: [`QuotedPrintableEncode`] and
-//! [`QuotedPrintableDecode`] take the caller's input and output buffers chunk
-//! by chunk, as any I/O-free coroutine does; the one-shot functions take a
-//! whole input at once.
+//! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
+//! the mode, text or binary, and the line ending of encoded output. Its
+//! one-shot methods take a whole input at once. [`QuotedPrintableEncode`] and
+//! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
+//! then the caller's input and output buffers chunk by chunk, as any I/O-free
+//! coroutine does.
 //!
 //! Both directions read their input in blocks of 32 bytes. A block takes a
 //! bitmask of its special bytes, built 16 lanes at a time in a shape
@@ -21,25 +23,26 @@
 //! decide yet, or have no room for, between two calls.
 //!
 //! ```
-//! use quoted_printable_codec::{
-//!     decode::decode,
-//!     encode::{QuotedPrintableEncodeOptions, encode, encoded_len_max},
-//! };
+//! use quoted_printable_codec::codec::{QuotedPrintableCodec, QuotedPrintableEol};
 //!
 //! let input = "Grüße,\nJürgen\n".as_bytes();
-//! let opts = QuotedPrintableEncodeOptions::default();
+//! let codec = QuotedPrintableCodec {
+//!     eol: QuotedPrintableEol::Crlf,
+//!     binary: false,
+//! };
 //!
 //! let mut encoded = [0; 64];
-//! assert!(encoded.len() >= encoded_len_max(input.len(), opts).unwrap());
-//! let len = encode(input, &mut encoded, opts).unwrap();
+//! assert!(encoded.len() >= codec.encoded_len_max(input.len()).unwrap());
+//! let len = codec.encode(input, &mut encoded).unwrap();
 //! assert_eq!(&encoded[..len], b"Gr=C3=BC=C3=9Fe,\r\nJ=C3=BCrgen\r\n");
 //!
 //! let mut decoded = [0; 64];
-//! let output = decode(&encoded[..len], &mut decoded).unwrap();
+//! let output = codec.decode(&encoded[..len], &mut decoded).unwrap();
 //! assert_eq!(&decoded[..output.written], "Grüße,\r\nJürgen\r\n".as_bytes());
 //! assert!(output.clean);
 //! ```
 //!
+//! [`QuotedPrintableCodec`]: codec::QuotedPrintableCodec
 //! [`QuotedPrintableEncode`]: encode::QuotedPrintableEncode
 //! [`QuotedPrintableDecode`]: decode::QuotedPrintableDecode
 
@@ -50,6 +53,7 @@
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
+pub mod codec;
 pub mod decode;
 mod edge;
 pub mod encode;
@@ -100,7 +104,11 @@ fn window<'a>(src: &'a [u8], end: &'a [u8; 128]) -> &'a [u8; 64] {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use crate::{decode::*, encode::*};
+    use crate::{
+        codec::{QuotedPrintableCodec, QuotedPrintableEol},
+        decode::*,
+        encode::*,
+    };
 
     /// A xorshift stream, the same every run.
     struct Random(u64);
@@ -127,27 +135,28 @@ mod tests {
             .collect()
     }
 
-    fn options() -> [QuotedPrintableEncodeOptions; 4] {
+    fn codecs() -> [QuotedPrintableCodec; 4] {
         [false, true]
             .map(|binary| {
                 [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf]
-                    .map(|eol| QuotedPrintableEncodeOptions { eol, binary })
+                    .map(|eol| QuotedPrintableCodec { eol, binary })
             })
             .concat()
             .try_into()
             .unwrap()
     }
 
-    fn encoded(src: &[u8], opts: QuotedPrintableEncodeOptions) -> Vec<u8> {
-        let mut out = vec![0; encoded_len_max(src.len(), opts).unwrap()];
-        let written = encode(src, &mut out, opts).unwrap();
+    fn encoded(src: &[u8], codec: QuotedPrintableCodec) -> Vec<u8> {
+        let mut out = vec![0; codec.encoded_len_max(src.len()).unwrap()];
+        let written = codec.encode(src, &mut out).unwrap();
         out.truncate(written);
         out
     }
 
     fn decoded(src: &[u8]) -> (Vec<u8>, bool) {
-        let mut out = vec![0; decoded_len_max(src.len())];
-        let output = decode(src, &mut out).unwrap();
+        let codec = QuotedPrintableCodec::default();
+        let mut out = vec![0; codec.decoded_len_max(src.len())];
+        let output = codec.decode(src, &mut out).unwrap();
         out.truncate(output.written);
         (out, output.clean)
     }
@@ -157,8 +166,8 @@ mod tests {
         let mut random = Random(0x1234_5678_9abc_def1);
 
         for body in bodies(&mut random) {
-            for opts in options() {
-                let mut encoder = QuotedPrintableEncode::new(opts);
+            for codec in codecs() {
+                let mut encoder = QuotedPrintableEncode::new(codec);
                 let mut out = Vec::new();
 
                 for chunk in body.chunks(1 + random.below(40)) {
@@ -175,14 +184,14 @@ mod tests {
                 let mut room = vec![0; 300];
                 let end = encoder.finish(&mut room).unwrap();
                 out.extend_from_slice(&room[..end]);
-                assert_eq!(out, encoded(&body, opts));
+                assert_eq!(out, encoded(&body, codec));
             }
 
             for src in [
                 body.clone(),
-                encoded(&body, QuotedPrintableEncodeOptions::default()),
+                encoded(&body, QuotedPrintableCodec::default()),
             ] {
-                let mut decoder = QuotedPrintableDecode::new();
+                let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec::default());
                 let mut out = Vec::new();
 
                 for chunk in src.chunks(1 + random.below(40)) {
@@ -214,8 +223,8 @@ mod tests {
         };
 
         for body in bodies(&mut Random(0x0f1e_2d3c_4b5a_6978)) {
-            for opts in options() {
-                let out = encoded(&body, opts);
+            for codec in codecs() {
+                let out = encoded(&body, codec);
                 let (back, clean) = decoded(&out);
                 fold(&out);
                 fold(&back);

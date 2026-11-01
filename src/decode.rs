@@ -9,14 +9,15 @@
 //! anything else is kept. Decoding never fails: it returns the bytes, and
 //! whether the input was clean.
 //!
-//! [`QuotedPrintableDecode`] takes the input chunk by chunk; [`decode`] and
-//! `decode_vec` run its core once over a whole input. Encoding is the
-//! sibling module [`encode`](crate::encode).
+//! [`QuotedPrintableDecode`] takes the input chunk by chunk; the one-shot
+//! [`QuotedPrintableCodec::decode`] and `QuotedPrintableCodec::decode_vec`
+//! run its core once over a whole input. Encoding is the sibling module
+//! [`encode`](crate::encode).
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::{edge::Edge, is_blank, is_plain, mask, pad, window};
+use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, pad, window};
 
 /// The most trailing spaces and tabs a line break deletes: past them, the
 /// oldest are kept as data, as no well-formed line holds that many.
@@ -34,9 +35,9 @@ const CARRY: usize = BLANKS_MAX + 4;
 /// may end a line.
 ///
 /// ```
-/// use quoted_printable_codec::decode::QuotedPrintableDecode;
+/// use quoted_printable_codec::{codec::QuotedPrintableCodec, decode::QuotedPrintableDecode};
 ///
-/// let mut decoder = QuotedPrintableDecode::new();
+/// let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec::default());
 /// let mut out = [0; 16];
 ///
 /// let first = decoder.resume(b"caf=C", &mut out);
@@ -56,8 +57,9 @@ pub struct QuotedPrintableDecode {
 }
 
 impl QuotedPrintableDecode {
-    /// Builds a decoder.
-    pub fn new() -> Self {
+    /// Builds a decoder, whatever the mode and the line ending of the codec:
+    /// decoding takes any.
+    pub fn new(_: QuotedPrintableCodec) -> Self {
         Self::default()
     }
 
@@ -109,42 +111,47 @@ pub struct QuotedPrintableDecodeOutput {
     pub clean: bool,
 }
 
-/// Decodes the whole of `src` into `dst`.
-///
-/// Returns none, writing nothing, when `dst` is shorter than
-/// [`decoded_len_max`] asks. The bytes of `dst` past the ones written may be
-/// overwritten, to its end.
-pub fn decode(src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
-    if dst.len() < decoded_len_max(src.len()) {
-        return None;
+/// One-shot decoding.
+impl QuotedPrintableCodec {
+    /// Decodes the whole of `src` into `dst`.
+    ///
+    /// Returns none, writing nothing, when `dst` is shorter than
+    /// [`decoded_len_max`](Self::decoded_len_max) asks. The bytes of `dst`
+    /// past the ones written may be overwritten, to its end.
+    #[inline]
+    pub fn decode(self, src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
+        if dst.len() < self.decoded_len_max(src.len()) {
+            return None;
+        }
+
+        let mut dirty = false;
+        let [read, written, _] = tokens(src, dst, true, &mut dirty);
+
+        Some(QuotedPrintableDecodeOutput {
+            read,
+            written,
+            clean: !dirty,
+        })
     }
 
-    let mut dirty = false;
-    let [read, written, _] = tokens(src, dst, true, &mut dirty);
+    /// Decodes the whole of `src` at the end of `out`, returning whether it
+    /// was well-formed.
+    #[cfg(feature = "alloc")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+    pub fn decode_vec(self, src: &[u8], out: &mut Vec<u8>) -> bool {
+        let start = out.len();
+        out.resize(start + self.decoded_len_max(src.len()), 0);
+        let output = self.decode(src, &mut out[start..]).unwrap();
+        out.truncate(start + output.written);
+        output.clean
+    }
 
-    Some(QuotedPrintableDecodeOutput {
-        read,
-        written,
-        clean: !dirty,
-    })
-}
-
-/// Decodes the whole of `src` at the end of `out`, returning whether it was
-/// well-formed.
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-pub fn decode_vec(src: &[u8], out: &mut Vec<u8>) -> bool {
-    let start = out.len();
-    out.resize(start + decoded_len_max(src.len()), 0);
-    let output = decode(src, &mut out[start..]).unwrap();
-    out.truncate(start + output.written);
-    output.clean
-}
-
-/// The most bytes [`decode`] writes for an input of `len` bytes, whatever
-/// they hold: every output byte comes from at least one input byte.
-pub const fn decoded_len_max(len: usize) -> usize {
-    len
+    /// The most bytes [`decode`](Self::decode) writes for an input of `len`
+    /// bytes, whatever they hold: every output byte comes from at least one
+    /// input byte.
+    pub const fn decoded_len_max(self, len: usize) -> usize {
+        len
+    }
 }
 
 /// Decodes the tokens of `src` into `dst`, at least as long, returning the
@@ -366,14 +373,16 @@ static DIGITS: [[u16; 256]; 2] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use crate::{
-        decode::*,
-        encode::{QuotedPrintableEncodeOptions, encode, encoded_len_max},
+    use crate::{codec::QuotedPrintableEol, decode::*};
+
+    const CODEC: QuotedPrintableCodec = QuotedPrintableCodec {
+        eol: QuotedPrintableEol::Crlf,
+        binary: false,
     };
 
     fn decoded(input: &[u8]) -> (Vec<u8>, bool) {
-        let mut out = vec![0; decoded_len_max(input.len())];
-        let output = decode(input, &mut out).unwrap();
+        let mut out = vec![0; CODEC.decoded_len_max(input.len())];
+        let output = CODEC.decode(input, &mut out).unwrap();
         out.truncate(output.written);
         (out, output.clean)
     }
@@ -444,13 +453,9 @@ mod tests {
             .collect();
 
         for binary in [false, true] {
-            let opts = QuotedPrintableEncodeOptions {
-                binary,
-                ..Default::default()
-            };
-
-            let mut encoded = vec![0; encoded_len_max(input.len(), opts).unwrap()];
-            let len = encode(&input, &mut encoded, opts).unwrap();
+            let codec = QuotedPrintableCodec { binary, ..CODEC };
+            let mut encoded = vec![0; codec.encoded_len_max(input.len()).unwrap()];
+            let len = codec.encode(&input, &mut encoded).unwrap();
             let (out, is_clean) = decoded(&encoded[..len]);
             assert!(is_clean);
 
@@ -471,7 +476,7 @@ mod tests {
         let mut input = vec![b'\t'; BLANKS_MAX];
         input.extend_from_slice(b"x=41=\r\n");
 
-        let mut decoder = QuotedPrintableDecode::new();
+        let mut decoder = QuotedPrintableDecode::new(CODEC);
         let mut src = &input[..];
         let mut out = Vec::new();
         let mut room = [0; 1];
@@ -490,10 +495,10 @@ mod tests {
     #[test]
     fn a_short_buffer_writes_nothing() {
         let mut out = [0xaa; 2];
-        assert_eq!(decode(b"abc", &mut out), None);
+        assert_eq!(CODEC.decode(b"abc", &mut out), None);
         assert_eq!(out, [0xaa; 2]);
 
-        let mut decoder = QuotedPrintableDecode::new();
+        let mut decoder = QuotedPrintableDecode::new(CODEC);
         decoder.resume(b"=4", &mut []);
         assert_eq!(decoder.finish(&mut out[..1]), None);
         assert_eq!(decoder.finish(&mut out).map(|end| end.written), Some(2));
@@ -504,7 +509,7 @@ mod tests {
     #[cfg(feature = "alloc")]
     fn a_vec_is_appended_to() {
         let mut out = b"> ".to_vec();
-        assert!(decode_vec(b"a=3Db", &mut out));
+        assert!(CODEC.decode_vec(b"a=3Db", &mut out));
         assert_eq!(out, b"> a=b");
     }
 }

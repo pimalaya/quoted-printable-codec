@@ -6,21 +6,18 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use quoted_printable_codec::{
-    decode::{decode, decoded_len_max},
-    encode::{QuotedPrintableEncodeOptions, encode, encoded_len_max},
-};
+use quoted_printable_codec::codec::{QuotedPrintableCodec, QuotedPrintableEol};
 
 const SIZES: [usize; 3] = [64, 4 * 1024, 1024 * 1024];
 
-const TEXT: QuotedPrintableEncodeOptions = QuotedPrintableEncodeOptions {
-    eol: quoted_printable_codec::encode::QuotedPrintableEol::Crlf,
+const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
+    eol: QuotedPrintableEol::Crlf,
     binary: false,
 };
 
-const BINARY: QuotedPrintableEncodeOptions = QuotedPrintableEncodeOptions {
-    eol: quoted_printable_codec::encode::QuotedPrintableEol::Crlf,
+const BINARY: QuotedPrintableCodec = QuotedPrintableCodec {
     binary: true,
+    ..TEXT
 };
 
 /// A xorshift stream, the same every run.
@@ -74,8 +71,8 @@ const ACCENTED: [&str; 28] = [
     "b", "v", "ç", "e", "t", "a", "o", ".", "ê",
 ];
 
-/// The three bodies at `len` bytes, with the options that encode them.
-fn inputs(len: usize) -> [(&'static str, Vec<u8>, QuotedPrintableEncodeOptions); 3] {
+/// The three bodies at `len` bytes, with the codec that encodes them.
+fn inputs(len: usize) -> [(&'static str, Vec<u8>, QuotedPrintableCodec); 3] {
     let binary = random().take(len).map(|word| word as u8).collect();
 
     [
@@ -92,17 +89,17 @@ fn encodes(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(3));
 
         for size in SIZES {
-            let (_, src, opts) = inputs(size).into_iter().find(|(k, ..)| *k == kind).unwrap();
-            let mut out = vec![0; encoded_len_max(size, opts).unwrap()];
+            let (_, src, codec) = inputs(size).into_iter().find(|(k, ..)| *k == kind).unwrap();
+            let mut out = vec![0; codec.encoded_len_max(size).unwrap()];
             group.throughput(Throughput::Bytes(size as u64));
 
             group.bench_with_input(
                 BenchmarkId::new("quoted-printable-codec", size),
                 &src,
-                |b, src| b.iter(|| encode(black_box(src), &mut out, opts)),
+                |b, src| b.iter(|| codec.encode(black_box(src), &mut out)),
             );
 
-            let engine = match opts.binary {
+            let engine = match codec.binary {
                 false => encodify::qp::BODY,
                 true => encodify::qp::BINARY,
             };
@@ -116,7 +113,7 @@ fn encodes(c: &mut Criterion) {
                 BenchmarkId::new("quoted_printable", size),
                 &src,
                 |b, src| {
-                    b.iter(|| match opts.binary {
+                    b.iter(|| match codec.binary {
                         false => quoted_printable::encode(black_box(src)),
                         true => quoted_printable::encode_binary(black_box(src)),
                     })
@@ -135,17 +132,17 @@ fn decodes(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(3));
 
         for size in SIZES {
-            let (_, raw, opts) = inputs(size).into_iter().find(|(k, ..)| *k == kind).unwrap();
-            let mut src = vec![0; encoded_len_max(size, opts).unwrap()];
-            let len = encode(&raw, &mut src, opts).unwrap();
+            let (_, raw, codec) = inputs(size).into_iter().find(|(k, ..)| *k == kind).unwrap();
+            let mut src = vec![0; codec.encoded_len_max(size).unwrap()];
+            let len = codec.encode(&raw, &mut src).unwrap();
             src.truncate(len);
 
-            let mut out = vec![0; decoded_len_max(src.len()) + 64];
+            let mut out = vec![0; codec.decoded_len_max(src.len()) + 64];
             group.throughput(Throughput::Bytes(size as u64));
 
             // NOTE: every decoder gives back the raw bytes, so they all do
             // the same work.
-            let written = decode(&src, &mut out).unwrap().written;
+            let written = codec.decode(&src, &mut out).unwrap().written;
             assert_eq!(out[..written], raw);
             let written = encodify::qp::BODY.decode_slice(&src, &mut out).unwrap();
             assert_eq!(out[..written], raw);
@@ -157,7 +154,7 @@ fn decodes(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new("quoted-printable-codec", size),
                 &src,
-                |b, src| b.iter(|| decode(black_box(src), &mut out)),
+                |b, src| b.iter(|| codec.decode(black_box(src), &mut out)),
             );
 
             group.bench_with_input(BenchmarkId::new("encodify", size), &src, |b, src| {

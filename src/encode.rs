@@ -9,14 +9,15 @@
 //! CR in text mode and a space or tab that would end a line are escaped as
 //! `=XX`, uppercase; an escape is never split across lines.
 //!
-//! [`QuotedPrintableEncode`] takes the input chunk by chunk; [`encode`] and
-//! `encode_vec` run it once over a whole input. Decoding is the
-//! sibling module [`decode`](crate::decode).
+//! [`QuotedPrintableEncode`] takes the input chunk by chunk; the one-shot
+//! [`QuotedPrintableCodec::encode`] and `QuotedPrintableCodec::encode_vec`
+//! encode a whole input. Decoding is the sibling module
+//! [`decode`](crate::decode).
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::{edge::Edge, is_blank, is_plain, mask, pad, window};
+use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, pad, window};
 
 /// The most characters a line holds before its soft break `=`.
 const LINE: usize = 75;
@@ -33,9 +34,9 @@ const ROOM: usize = 3 * 32 + 6 + 32;
 /// line ends there.
 ///
 /// ```
-/// use quoted_printable_codec::encode::{QuotedPrintableEncode, QuotedPrintableEncodeOptions};
+/// use quoted_printable_codec::{codec::QuotedPrintableCodec, encode::QuotedPrintableEncode};
 ///
-/// let mut encoder = QuotedPrintableEncode::new(QuotedPrintableEncodeOptions::default());
+/// let mut encoder = QuotedPrintableEncode::new(QuotedPrintableCodec::default());
 /// let mut out = [0; 32];
 ///
 /// let first = encoder.resume(b"a = b ", &mut out);
@@ -49,17 +50,17 @@ const ROOM: usize = 3 * 32 + 6 + 32;
 /// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
 #[derive(Clone, Debug)]
 pub struct QuotedPrintableEncode {
-    opts: QuotedPrintableEncodeOptions,
+    codec: QuotedPrintableCodec,
     column: usize,
     // NOTE: carries a block, queues what a block touches.
     edge: Edge<32, ROOM>,
 }
 
 impl QuotedPrintableEncode {
-    /// Builds an encoder.
-    pub fn new(opts: QuotedPrintableEncodeOptions) -> Self {
+    /// Builds an encoder running the mode and the line ending of `codec`.
+    pub fn new(codec: QuotedPrintableCodec) -> Self {
         Self {
-            opts,
+            codec,
             column: 0,
             edge: Edge::default(),
         }
@@ -71,9 +72,9 @@ impl QuotedPrintableEncode {
     /// next chunk; one byte of room always lets the encoder progress. The
     /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableEncodeOutput {
-        let (opts, column) = (self.opts, &mut self.column);
+        let (codec, column) = (self.codec, &mut self.column);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
-            blocks(src, dst, last, opts, column)
+            blocks(src, dst, last, codec, column)
         });
 
         QuotedPrintableEncodeOutput { read, written }
@@ -87,40 +88,8 @@ impl QuotedPrintableEncode {
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
         let mut column = self.column;
         self.edge.finish(dst, |src, dst| {
-            blocks(src, dst, true, self.opts, &mut column)[1]
+            blocks(src, dst, true, self.codec, &mut column)[1]
         })
-    }
-}
-
-/// Options of [`QuotedPrintableEncode`] and [`encode`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct QuotedPrintableEncodeOptions {
-    /// The line ending of hard and soft line breaks. Defaults to CRLF.
-    pub eol: QuotedPrintableEol,
-    /// Whether CR and LF are escaped as data rather than read as line
-    /// breaks, as binary content such as an attachment needs. Defaults to
-    /// text.
-    pub binary: bool,
-}
-
-/// The line ending of the output.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum QuotedPrintableEol {
-    /// CR LF, as the wire format of mail has it.
-    #[default]
-    Crlf,
-    /// LF alone, as mail stored on disk often has it.
-    Lf,
-}
-
-impl QuotedPrintableEol {
-    /// The soft line break, `=` and the line ending, padded to 4 bytes, and
-    /// its length.
-    const fn soft_break(self) -> ([u8; 4], usize) {
-        match self {
-            Self::Crlf => (*b"=\r\n\0", 3),
-            Self::Lf => (*b"=\n\0\0", 2),
-        }
     }
 }
 
@@ -133,48 +102,50 @@ pub struct QuotedPrintableEncodeOutput {
     pub written: usize,
 }
 
-/// Encodes the whole of `src` into `dst`, returning the bytes written.
-///
-/// Returns none, writing nothing, when `dst` is shorter than
-/// [`encoded_len_max`] asks. Within that length, the bytes of `dst` past the
-/// ones written may be overwritten.
-pub fn encode(src: &[u8], dst: &mut [u8], opts: QuotedPrintableEncodeOptions) -> Option<usize> {
-    let dst = dst.get_mut(..encoded_len_max(src.len(), opts)?)?;
-    let mut column = 0;
-    let [read, written, _] = blocks(src, dst, true, opts, &mut column);
+/// One-shot encoding.
+impl QuotedPrintableCodec {
+    /// Encodes the whole of `src` into `dst`, returning the bytes written.
+    ///
+    /// Returns none, writing nothing, when `dst` is shorter than
+    /// [`encoded_len_max`](Self::encoded_len_max) asks. Within that length,
+    /// the bytes of `dst` past the ones written may be overwritten.
+    #[inline]
+    pub fn encode(self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
+        let dst = dst.get_mut(..self.encoded_len_max(src.len())?)?;
+        let mut column = 0;
+        let [read, written, _] = blocks(src, dst, true, self, &mut column);
 
-    if read == src.len() {
-        return Some(written);
+        if read == src.len() {
+            return Some(written);
+        }
+
+        let mut spare = [0; 2 * ROOM];
+        let [_, rest, _] = blocks(&src[read..], &mut spare, true, self, &mut column);
+        dst[written..written + rest].copy_from_slice(&spare[..rest]);
+        Some(written + rest)
     }
 
-    let mut spare = [0; 2 * ROOM];
-    let [_, rest, _] = blocks(&src[read..], &mut spare, true, opts, &mut column);
-    dst[written..written + rest].copy_from_slice(&spare[..rest]);
-    Some(written + rest)
-}
+    /// Encodes the whole of `src` at the end of `out`.
+    #[cfg(feature = "alloc")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+    pub fn encode_vec(self, src: &[u8], out: &mut Vec<u8>) {
+        let start = out.len();
+        let len = self.encoded_len_max(src.len()).unwrap_or(usize::MAX);
+        out.resize(start + len, 0);
 
-/// Encodes the whole of `src` at the end of `out`.
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-pub fn encode_vec(src: &[u8], out: &mut Vec<u8>, opts: QuotedPrintableEncodeOptions) {
-    let start = out.len();
-    out.resize(
-        start + encoded_len_max(src.len(), opts).unwrap_or(usize::MAX),
-        0,
-    );
+        let written = self.encode(src, &mut out[start..]).unwrap_or(0);
+        out.truncate(start + written);
+    }
 
-    let written = encode(src, &mut out[start..], opts).unwrap_or(0);
-    out.truncate(start + written);
-}
-
-/// The most bytes [`encode`] writes for an input of `len` bytes, whatever
-/// they hold, or none when that overflows `usize`.
-///
-/// Every byte takes at most three characters, and a soft break follows at
-/// least 73 characters, so at least 25 input bytes.
-pub fn encoded_len_max(len: usize, opts: QuotedPrintableEncodeOptions) -> Option<usize> {
-    let breaks = (len / 25 + 1).checked_mul(opts.eol.soft_break().1)?;
-    len.checked_mul(3)?.checked_add(breaks)
+    /// The most bytes [`encode`](Self::encode) writes for an input of `len`
+    /// bytes, whatever they hold, or none when that overflows `usize`.
+    ///
+    /// Every byte takes at most three characters, and a soft break follows
+    /// at least 73 characters, so at least 25 input bytes.
+    pub fn encoded_len_max(self, len: usize) -> Option<usize> {
+        let breaks = (len / 25 + 1).checked_mul(self.eol.soft_break().1)?;
+        len.checked_mul(3)?.checked_add(breaks)
+    }
 }
 
 /// Encodes `src` into `dst` from `column` in blocks of 32 bytes, as many as
@@ -188,11 +159,11 @@ fn blocks(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
-    opts: QuotedPrintableEncodeOptions,
+    codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    let text = !opts.binary;
-    let (soft, soft_len) = opts.eol.soft_break();
+    let text = !codec.binary;
+    let (soft, soft_len) = codec.eol.soft_break();
     // NOTE: padded first, so that its stores are done when blocks load them.
     let mut end = [0; 128];
     pad(&mut end, src);
@@ -310,22 +281,27 @@ static ESCAPES: [[u8; 4]; 256] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use crate::encode::*;
+    use crate::{codec::QuotedPrintableEol, encode::*};
 
-    const BINARY: QuotedPrintableEncodeOptions = QuotedPrintableEncodeOptions {
+    const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
         eol: QuotedPrintableEol::Crlf,
-        binary: true,
+        binary: false,
     };
 
-    fn encoded(input: &[u8], opts: QuotedPrintableEncodeOptions) -> Vec<u8> {
-        let mut out = vec![0; encoded_len_max(input.len(), opts).unwrap()];
-        let written = encode(input, &mut out, opts).unwrap();
+    const BINARY: QuotedPrintableCodec = QuotedPrintableCodec {
+        binary: true,
+        ..TEXT
+    };
+
+    fn encoded(input: &[u8], codec: QuotedPrintableCodec) -> Vec<u8> {
+        let mut out = vec![0; codec.encoded_len_max(input.len()).unwrap()];
+        let written = codec.encode(input, &mut out).unwrap();
         out.truncate(written);
         out
     }
 
     fn text(input: &[u8]) -> Vec<u8> {
-        encoded(input, QuotedPrintableEncodeOptions::default())
+        encoded(input, TEXT)
     }
 
     #[test]
@@ -342,9 +318,9 @@ mod tests {
         assert_eq!(text(b"a\rb"), b"a=0Db");
         assert_eq!(text(b"a\r"), b"a=0D");
 
-        let lf = QuotedPrintableEncodeOptions {
+        let lf = QuotedPrintableCodec {
             eol: QuotedPrintableEol::Lf,
-            binary: false,
+            ..TEXT
         };
 
         assert_eq!(encoded(b"a\r\nb", lf), b"a\nb");
@@ -379,10 +355,10 @@ mod tests {
     fn the_length_bound_holds() {
         for len in 0..200 {
             for byte in [b'x', b' ', b'\n', 0xff] {
-                for opts in [QuotedPrintableEncodeOptions::default(), BINARY] {
+                for codec in [TEXT, BINARY] {
                     let input = vec![byte; len];
-                    let out = encoded(&input, opts);
-                    assert!(out.len() <= encoded_len_max(len, opts).unwrap());
+                    let out = encoded(&input, codec);
+                    assert!(out.len() <= codec.encoded_len_max(len).unwrap());
                 }
             }
         }
@@ -392,8 +368,8 @@ mod tests {
     fn one_byte_of_room_always_progresses() {
         let input: Vec<u8> = (0..=255).chain(b"a \r\nb \rc\t".iter().copied()).collect();
 
-        for opts in [QuotedPrintableEncodeOptions::default(), BINARY] {
-            let mut encoder = QuotedPrintableEncode::new(opts);
+        for codec in [TEXT, BINARY] {
+            let mut encoder = QuotedPrintableEncode::new(codec);
             let mut src = &input[..];
             let mut out = Vec::new();
             let mut room = [0; 1];
@@ -408,18 +384,17 @@ mod tests {
             let mut tail = [0; ROOM];
             let end = encoder.finish(&mut tail).unwrap();
             out.extend_from_slice(&tail[..end]);
-            assert_eq!(out, encoded(&input, opts));
+            assert_eq!(out, encoded(&input, codec));
         }
     }
 
     #[test]
     fn a_short_buffer_writes_nothing() {
         let mut out = [0xaa; 3];
-        let opts = QuotedPrintableEncodeOptions::default();
-        assert_eq!(encode(b"f", &mut out, opts), None);
+        assert_eq!(TEXT.encode(b"f", &mut out), None);
         assert_eq!(out, [0xaa; 3]);
 
-        let mut encoder = QuotedPrintableEncode::new(opts);
+        let mut encoder = QuotedPrintableEncode::new(TEXT);
         assert_eq!(encoder.resume(b" ", &mut []).read, 1);
         assert_eq!(encoder.finish(&mut out[..2]), None);
         assert_eq!(encoder.finish(&mut out), Some(3));
@@ -430,7 +405,7 @@ mod tests {
     #[cfg(feature = "alloc")]
     fn a_vec_is_appended_to() {
         let mut out = b"> ".to_vec();
-        encode_vec(b"a=b", &mut out, QuotedPrintableEncodeOptions::default());
+        TEXT.encode_vec(b"a=b", &mut out);
         assert_eq!(out, b"> a=3Db");
     }
 }
