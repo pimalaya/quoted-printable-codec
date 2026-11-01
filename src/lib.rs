@@ -31,7 +31,7 @@
 //!     binary: false,
 //! };
 //!
-//! let mut encoded = [0; 64];
+//! let mut encoded = [0; 256];
 //! assert!(encoded.len() >= codec.encoded_len_max(input.len()).unwrap());
 //! let len = codec.encode(input, &mut encoded).unwrap();
 //! assert_eq!(&encoded[..len], b"Gr=C3=BC=C3=9Fe,\r\nJ=C3=BCrgen\r\n");
@@ -237,5 +237,28 @@ mod tests {
         }
 
         assert_eq!(hash, 5_623_604_759_311_401_023);
+    }
+
+    #[test]
+    fn a_finished_coroutine_starts_over() {
+        let codec = QuotedPrintableCodec::default();
+        let mut encoder = QuotedPrintableEncode::new(codec);
+        let mut decoder = QuotedPrintableDecode::new(codec);
+        let mut out = [0; 512];
+
+        for src in [&b"a=zb"[..], &[b'x'; 50], &[b'x'; 50]] {
+            let written = encoder.resume(src, &mut out).written;
+            let end = encoder.finish(&mut out[written..]).unwrap();
+            assert_eq!(out[..written + end], encoded(src, codec));
+        }
+
+        for src in [&b"a=zb"[..], b"a=3Db"] {
+            let written = decoder.resume(src, &mut out).written;
+            let end = decoder.finish(&mut out[written..]).unwrap();
+            assert_eq!(
+                (out[..written + end.written].to_vec(), end.clean),
+                decoded(src)
+            );
+        }
     }
 }

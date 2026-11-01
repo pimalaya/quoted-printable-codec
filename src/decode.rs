@@ -84,13 +84,14 @@ impl QuotedPrintableDecode {
     /// Ends the input: writes what is still queued and a malformed escape
     /// left unfinished, and drops the trailing spaces, tabs and CR.
     ///
-    /// Returns none, writing nothing, when `dst` is too short.
+    /// Returns none, writing nothing, when `dst` is too short; otherwise the
+    /// decoder starts over for another input.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         let mut dirty = self.dirty;
         let written = self
             .edge
             .finish(dst, |src, dst| tokens(src, dst, true, &mut dirty)[1])?;
-        self.dirty = dirty;
+        self.dirty = false;
 
         Some(QuotedPrintableDecodeOutput {
             read: 0,
@@ -165,27 +166,16 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3
     let mut read = 0;
     let mut written = 0;
     let mut blanks = 0;
-    let mut irregular = 0;
     // NOTE: padded first, so that its stores are done when blocks load them.
     let mut end = [0; 128];
     pad(&mut end, src);
 
     loop {
-        if read >= irregular && src.len() - read >= 8 {
-            let [r, w] = blocks(&src[read..], &end, &mut dst[written..], &mut blanks, dirty);
-            read += r;
-            written += w;
-            irregular = read + 1;
-        }
+        let [r, w] = blocks(&src[read..], &end, &mut dst[written..], &mut blanks, dirty);
+        read += r;
+        written += w;
 
         match src[read..] {
-            [b'=', high, low, ..] if escape(high, low) < 0x8000 => {
-                let value = escape(high, low);
-                *dirty |= value & 0x1000 != 0;
-                dst[written] = value as u8;
-                read += 3;
-                written += 1;
-            }
             [b'=', ref after @ ..] => {
                 let spaces = after
                     .iter()
@@ -223,22 +213,15 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3
                 read += len;
                 written += len;
             }
-            [b'\r', ref rest @ ..] if last || !rest.is_empty() => {
-                *dirty = true;
-                read += 1;
-                continue;
-            }
-            [] | [b'\r'] => {
+            [] | [b'\r'] if !last || read == src.len() => {
                 let held = blanks.min(BLANKS_MAX);
                 written -= held;
                 return [read, written, if last { 0 } else { held }];
             }
-            [byte, ..] => {
-                dst[written] = byte;
-                *dirty |= !is_plain(byte);
-                blanks = if is_blank(byte) { blanks + 1 } else { 0 };
+            // NOTE: a bare CR, as blocks stop on nothing else.
+            _ => {
+                *dirty = true;
                 read += 1;
-                written += 1;
                 continue;
             }
         }
@@ -248,7 +231,7 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3
 }
 
 /// Decodes `src` into `dst`, at least as long, in blocks of 32 bytes, up to
-/// the first byte a block leaves to the token steps or the last 8 bytes,
+/// the first byte a block leaves to the token steps or the end of `src`,
 /// returning the bytes read and written; `end` holds the end of the input as
 /// [`pad`] copies it, `blanks` counts the spaces and tabs the next line break
 /// would delete, and `dirty` turns true on a byte that is not clean.
@@ -270,7 +253,7 @@ fn blocks(
     let mut flags = 0;
     let mut spare = [0; 64];
 
-    while src.len() - read >= 8 {
+    while src.len() > read {
         let rest = src.len() - read;
         let w = window(&src[read..], end);
         let direct = dst.len() - written >= 64;
@@ -278,7 +261,7 @@ fn blocks(
         let mut stop = rest.min(32);
         let mut events = !mask(w, is_plain) & u32::MAX >> (32 - stop);
         let mut r = 0;
-        let mut gap = 0;
+        let mut off = 64;
 
         while events != 0 {
             let at = events.trailing_zeros() as usize;
@@ -287,16 +270,16 @@ fn blocks(
             if w[at] == b'=' {
                 let [high, low] = [w[at + 1], w[at + 2]];
                 let value = escape(high, low);
-                out[(r - gap) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
+                out[(r + off) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
 
                 if value < 0x8000 {
-                    out[(at - gap) & 63] = value as u8;
+                    out[(at + off) & 63] = value as u8;
                     flags |= value;
-                    (r, gap) = (at + 3, gap + 2);
+                    (r, off) = (at + 3, off - 2);
                 } else if high == b'\n' {
-                    (r, gap) = (at + 2, gap + 2);
+                    (r, off) = (at + 2, off - 2);
                 } else if [high, low] == *b"\r\n" {
-                    (r, gap) = (at + 3, gap + 3);
+                    (r, off) = (at + 3, off - 3);
                 } else {
                     (r, stop) = (at, at);
                     break;
@@ -315,11 +298,11 @@ fn blocks(
         }
 
         if r < stop {
-            out[(r - gap) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
+            out[(r + off) & 31..][..32].copy_from_slice(&w[r & 31..][..32]);
             r = stop;
         }
 
-        let n = r - gap;
+        let n = r + off - 64;
 
         if !direct {
             dst[written..written + n].copy_from_slice(&spare[..n]);

@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: the-lean-pass
-status: draft
+status: landed
 created: 2026-11-01
 ---
 

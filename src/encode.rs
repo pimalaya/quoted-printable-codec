@@ -22,9 +22,9 @@ use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, p
 /// The most characters a line holds before its soft break `=`.
 const LINE: usize = 75;
 
-/// The most output bytes a block touches: 32 escapes, two soft breaks, and a
-/// run copied whole past them.
-const ROOM: usize = 3 * 32 + 6 + 32;
+/// The output bytes a block may touch: it commits at most 32 escapes and two
+/// soft breaks, under 128 bytes, and copies a run whole past them.
+const ROOM: usize = 128 + 32;
 
 /// I/O-free quoted-printable encoder, resumed with the caller's input and
 /// output buffers.
@@ -83,13 +83,15 @@ impl QuotedPrintableEncode {
     /// Ends the input: writes what is still queued and the carried space,
     /// tab or CR, escaped as the end of the input asks.
     ///
-    /// Returns the bytes written, or none, writing nothing, when `dst` is
-    /// too short.
+    /// Returns the bytes written, the encoder starting over for another
+    /// input, or none, writing nothing, when `dst` is too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
         let mut column = self.column;
-        self.edge.finish(dst, |src, dst| {
+        let written = self.edge.finish(dst, |src, dst| {
             blocks(src, dst, true, self.codec, &mut column)[1]
-        })
+        })?;
+        self.column = 0;
+        Some(written)
     }
 }
 
@@ -112,17 +114,7 @@ impl QuotedPrintableCodec {
     #[inline]
     pub fn encode(self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
         let dst = dst.get_mut(..self.encoded_len_max(src.len())?)?;
-        let mut column = 0;
-        let [read, written, _] = blocks(src, dst, true, self, &mut column);
-
-        if read == src.len() {
-            return Some(written);
-        }
-
-        let mut spare = [0; 2 * ROOM];
-        let [_, rest, _] = blocks(&src[read..], &mut spare, true, self, &mut column);
-        dst[written..written + rest].copy_from_slice(&spare[..rest]);
-        Some(written + rest)
+        Some(blocks(src, dst, true, self, &mut 0)[1])
     }
 
     /// Encodes the whole of `src` at the end of `out`.
@@ -137,14 +129,15 @@ impl QuotedPrintableCodec {
         out.truncate(start + written);
     }
 
-    /// The most bytes [`encode`](Self::encode) writes for an input of `len`
-    /// bytes, whatever they hold, or none when that overflows `usize`.
+    /// The room [`encode`](Self::encode) needs for an input of `len` bytes,
+    /// whatever they hold, or none when that overflows `usize`.
     ///
     /// Every byte takes at most three characters, and a soft break follows
-    /// at least 73 characters, so at least 25 input bytes.
+    /// at least 73 characters, so at least 25 input bytes; past them, the
+    /// room a block writes ahead of what it commits.
     pub fn encoded_len_max(self, len: usize) -> Option<usize> {
         let breaks = (len / 25 + 1).checked_mul(self.eol.soft_break().1)?;
-        len.checked_mul(3)?.checked_add(breaks)
+        len.checked_mul(3)?.checked_add(breaks + ROOM)
     }
 }
 
@@ -162,7 +155,23 @@ fn blocks(
     codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    let text = !codec.binary;
+    match codec.binary {
+        true => walk::<false>(src, dst, last, codec, column),
+        false => walk::<true>(src, dst, last, codec, column),
+    }
+}
+
+/// The loop of [`blocks`], built apart for each mode, `TEXT` reading line
+/// breaks: a mode tested for each byte costs a fifth of binary encoding.
+fn walk<const TEXT: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    last: bool,
+    codec: QuotedPrintableCodec,
+    column: &mut usize,
+) -> [usize; 3] {
+    // NOTE: a local, as the closure below compiles worse reading `TEXT`.
+    let text = TEXT;
     let (soft, soft_len) = codec.eol.soft_break();
     // NOTE: padded first, so that its stores are done when blocks load them.
     let mut end = [0; 128];
@@ -193,21 +202,22 @@ fn blocks(
 
         let breaks = |at: usize| text && (w[at] == b'\n' || w[at..].starts_with(b"\r\n"));
         let end = if rest > len { breaks(len) } else { last };
-        let mut events = !mask(w, is_plain) & u32::MAX >> (32 - len);
+        // NOTE: bit `len` stands for the block's end.
+        let mut events = !mask(w, is_plain) as u64 & !(u64::MAX << len) | 1 << len;
 
         if end && is_blank(w[len - 1]) {
             events |= 1 << (len - 1);
         }
 
         let mut from = 0;
-        let mut n = 0;
+        // NOTE: input byte `i` goes to output offset `i + off - 128`, and the
+        // line is full at output offset `lim - 128`: biased, both stay
+        // positive when CRs are dropped, and the bias vanishes under `& 127`.
+        let mut off = 128;
+        let mut lim = 128 + LINE - col;
 
-        loop {
-            let at = if events == 0 {
-                len
-            } else {
-                events.trailing_zeros() as usize
-            };
+        while events != 0 {
+            let at = events.trailing_zeros() as usize & 63;
             let line = at < len && breaks(at);
 
             if line && at > from && is_blank(w[at - 1]) {
@@ -215,48 +225,38 @@ fn blocks(
                 continue;
             }
 
-            let mut run = at - from;
+            let n = at + off;
 
-            if col + run > LINE {
-                let first = LINE - col;
-                out[n..][..32].copy_from_slice(&w[from..][..32]);
-                out[n + first..][..4].copy_from_slice(&soft);
-                n += first + soft_len;
-                from += first;
-                run -= first;
-                col = 0;
+            if n + 3 > lim && (n > lim || !line && at < len) {
+                let cut = n.min(lim);
+                out[(from + off) & 127..][..32].copy_from_slice(&w[from & 31..][..32]);
+                out[cut & 127..][..4].copy_from_slice(&soft);
+                from = cut - off;
+                off += soft_len;
+                lim = cut + soft_len + LINE;
             }
 
-            out[n..][..32].copy_from_slice(&w[from..][..32]);
-            n += run;
-            col += run;
+            out[(from + off) & 127..][..32].copy_from_slice(&w[from & 31..][..32]);
 
-            if at == len {
-                break;
-            }
-
+            // NOTE: the end's bit takes an escape too, past the output.
             if !line {
-                if col > LINE - 3 {
-                    out[n..][..4].copy_from_slice(&soft);
-                    n += soft_len;
-                    col = 0;
-                }
-
-                out[n..][..4].copy_from_slice(&ESCAPES[w[at] as usize]);
-                n += 3;
-                col += 3;
+                out[(at + off) & 127..][..4].copy_from_slice(&ESCAPES[w[at] as usize]);
+                off += 2;
             } else if w[at] == b'\n' {
-                out[n..][..3].copy_from_slice(&soft[1..]);
-                n += soft_len - 1;
-                col = 0;
+                out[(at + off) & 127..][..3].copy_from_slice(&soft[1..]);
+                off += soft_len - 2;
+                lim = at + off + 1 + LINE;
+            } else {
+                off -= 1;
             }
 
             from = at + 1;
             events &= events - 1;
         }
 
+        col = len + off - 2 + LINE - lim;
         read += len;
-        written += n;
+        written += len + off - 130;
     }
 
     *column = col;

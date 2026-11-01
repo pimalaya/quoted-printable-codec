@@ -1,6 +1,6 @@
 //! Throughput of quoted-printable-codec against encodify, the
 //! quoted_printable crate and mail-parser, encoding and decoding three kinds
-//! of body (ASCII text, accented text, binary), from 64 bytes to 1 MiB.
+//! of body (ASCII text, accented text, binary), from 64 bytes to 10 MiB.
 //! Throughput counts the raw bytes, on both sides.
 
 use std::{hint::black_box, time::Duration};
@@ -8,7 +8,7 @@ use std::{hint::black_box, time::Duration};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use quoted_printable_codec::codec::{QuotedPrintableCodec, QuotedPrintableEol};
 
-const SIZES: [usize; 3] = [64, 4 * 1024, 1024 * 1024];
+const SIZES: [usize; 4] = [64, 4 * 1024, 1024 * 1024, 10 * 1024 * 1024];
 
 const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
     eol: QuotedPrintableEol::Crlf,
