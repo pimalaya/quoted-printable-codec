@@ -1,0 +1,87 @@
+---
+cairn: change
+id: the-column-chain
+status: draft
+created: 2026-11-01
+---
+
+# The column chain
+
+The handoff of the sixth session of 2026-11-01 (log 2026-11-01-the-wider-reach), written for a fresh context to take over the optimisation without its history: where things stand, how to measure without fooling yourself, where the time goes, what was tried, and what is left.
+
+## Why
+
+The user's goal, as for base64-codec (../base64-codec): beat encodify 1.0.2 in every section of benches/compare.rs with the most concise code, each pass better than the last in speed and in size, free hands, searching online for new methods where needed; each pass ends with a handoff like this one and a commit. This pass made the AVX-512 kernels read ahead (the next chunk or block is classified before the current one is finished), built the bytes an escape takes once per chunk, and made the line ending a const generic of the AVX-512 encoder: by cycle counts, encoding runs 1.23x to 1.30x faster than the pass before on text and 1.57x to 1.74x on binary from 4 KiB up, decoding 1.05x to 1.19x, the 64-byte rows level within their noise, every row ahead of encodify by 1.3x to 46x. The code went from 805 to 786 lines (non-blank, non-comment lines of src/*.rs outside `#[cfg(test)]` items, after `cargo fmt`; the counter of the passes before gave 820 at pass 4, the same number). No published SIMD quoted-printable codec was found again; the closest relatives stay Muła and Lemire's base64 work, the Unicode transcoding paper (arXiv 2212.05098), node-yencode and rapidyenc.
+
+Settled so far: the CPU token is the application's: `QuotedPrintableCpu::new(simd_cpu::SimdCpu)`, a `const fn`, held by the codec; unsafe code serves only the AVX-512 backend, each block with a one-line `SAFETY` comment (`clippy::undocumented_unsafe_blocks` is denied); the portable backend stays as fast as before, as most x86 laptops (Intel since Alder Lake) and every aarch64 machine run it; the decoder's blank cap slides; every call may overwrite `dst` past what it reports, within its length; `encoded_len_max` includes the 200 bytes an encoding chunk may touch past its output; a successful `finish` resets a coroutine; lowercase hex digits decode but report unclean; a malformed escape keeps `=` and its hex digit and decodes what follows again; decoding never fails; names use `QuotedPrintable`, never `Qp`.
+
+## Where things stand
+
+The code: src/avx512.rs holds both kernels and one `TABLES` builder (digit checks and values for decoding, the three spread tables and the hex digits for encoding). `encode::<TEXT, CRLF>` (four monomorphizations; src/encode.rs `blocks` dispatches on the mode and the soft break's length) reads chunks of 63 bytes ahead: `chunk` loads 64 bytes and the 64 one byte on (masked to the input), and builds the bytes each byte takes (`lead`: the byte, `=`, or the CR or LF of a line break; `high`: its high hex digit or the LF of a CRLF; `low`: its low hex digit) and the masks (bytes to escape, line feeds, the CRs they drop); the loop takes the next chunk's `chunk` before the three groups of this one. A group of 21 bytes: `pdep` of the three masks into the three-lane space, the keep mask, one `vpermb` and two masked `vpermb` from the spread tables (loaded through `core::hint::black_box`), `vpcompressb`, then the soft break from two `pext` (token starts, line feeds): the token covering the line's first lane past its room (`room = 75 - col`) is the highest start under `bzhi(room + 1)`, cut unless a line feed comes at or before it; the column through `select_unpredictable`; three stores (the vector, the soft break, the vector again past it under a mask). The input's end is one masked partial chunk with the coroutine's hold logic, as before. `QuotedPrintableCpu::wide` still sends inputs of at most 64 bytes with at most 4 bytes to escape to the portable walk. `decode` scans a block (three loads, masked when fewer than 66 bytes are left; compares; escapes decoded with two `vpermb` and blended in; the masks of digits and soft breaks, of the bytes the token steps decide and of unclean bytes; the carry and blank the next block takes over, passed to its scan) one iteration ahead of cutting it at the first slow byte, compressing it and storing it under its valid lanes. src/decode.rs `tokens` and the portable code are the pass before's.
+
+Cycles per byte of raw input (`perf stat`, core 13, averaged over eight source and output offset pairs, plain build then aligned build), the AVX-512 backend (`detect` on this Zen 5) and the portable one against the tree before (commit 2c7604e, the pass before with the shared token) and encodify:
+
+| workload | AVX-512 cycles | instructions | misses per KiB | portable cycles | before AVX-512 | before portable | encodify cycles | encodify misses per KiB |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| encode ascii, 64 B | 1.19 / 1.30 | 7.5 | 0 | 1.15 / 1.24 | 1.27 / 1.29 | 1.18 / 1.22 | 1.99 / 1.97 | 0 |
+| encode ascii, 4 KiB | 0.78 / 0.80 | 4.0 | 0 | 1.12 / 1.10 | 1.00 / 1.01 | 1.14 / 1.11 | 1.97 / 1.96 | 0 |
+| encode ascii, 1 MiB | 0.77 / 0.78 | 3.9 | 0 | 2.18 / 2.21 | 1.00 / 1.01 | 2.17 / 2.16 | 4.20 / 4.16 | 80 |
+| encode accented, 64 B | 2.08 / 2.09 | 9.4 | 0 | 3.03 / 3.01 | 2.18 / 2.26 | 3.07 / 3.14 | 4.69 / 4.72 | 0 |
+| encode accented, 4 KiB | 0.79 / 0.78 | 4.0 | 0 | 2.59 / 2.58 | 0.98 / 0.96 | 2.59 / 2.59 | 4.25 / 4.24 | 0 |
+| encode accented, 1 MiB | 0.77 / 0.80 | 3.9 | 0 | 4.18 / 4.19 | 1.00 / 1.00 | 4.15 / 4.18 | 10.59 / 10.47 | 224 |
+| encode binary, 64 B | 1.51 / 1.58 | 7.2 | 0 | 3.46 / 3.48 | 1.73 / 1.62 | 3.44 / 3.61 | 7.37 / 7.25 | 0 |
+| encode binary, 4 KiB | 0.46 / 0.47 | 2.6 | 0 | 3.23 / 3.17 | 0.74 / 0.74 | 3.14 / 3.15 | 6.66 / 7.02 | 0 |
+| encode binary, 1 MiB | 0.46 / 0.47 | 2.5 | 0 | 4.36 / 4.46 | 0.77 / 0.82 | 4.39 / 4.29 | 21.00 / 21.63 | 478 |
+| decode ascii, 64 B | 1.32 / 1.30 | 7.1 | 0 | 1.21 / 1.18 | 1.27 / 1.26 | 1.17 / 1.18 | 1.71 / 1.68 | 0 |
+| decode ascii, 4 KiB | 0.43 / 0.43 | 2.1 | 0 | 0.84 / 0.86 | 0.45 / 0.47 | 0.86 / 0.84 | 1.73 / 1.73 | 0 |
+| decode ascii, 1 MiB | 0.38 / 0.37 | 2.0 | 0 | 2.02 / 2.02 | 0.43 / 0.42 | 2.01 / 2.01 | 3.72 / 3.92 | 74 |
+| decode accented, 64 B | 1.28 / 1.31 | 7.1 | 0 | 3.33 / 3.23 | 1.39 / 1.29 | 3.44 / 3.25 | 4.27 / 4.44 | 0 |
+| decode accented, 4 KiB | 0.61 / 0.55 | 2.9 | 0 | 2.58 / 2.58 | 0.66 / 0.61 | 2.59 / 2.56 | 3.90 / 3.92 | 0 |
+| decode accented, 1 MiB | 0.54 / 0.54 | 2.8 | 0 | 4.47 / 4.43 | 0.64 / 0.60 | 4.40 / 4.45 | 9.55 / 9.76 | 211 |
+| decode binary, 64 B | 1.56 / 1.56 | 8.9 | 0 | 5.84 / 5.34 | 1.60 / 1.62 | 5.50 / 5.65 | 6.00 / 5.98 | 0 |
+| decode binary, 4 KiB | 0.82 / 0.89 | 4.4 | 0 | 4.78 / 4.77 | 0.91 / 0.96 | 4.80 / 4.70 | 6.04 / 6.05 | 0 |
+| decode binary, 1 MiB | 0.81 / 0.89 | 4.3 | 0 | 6.60 / 6.70 | 0.90 / 0.96 | 6.58 / 6.57 | 18.39 / 18.79 | 464 |
+
+The 64-byte rows move by 5% to 7% between runs of the same binary (decoding ASCII at 64 bytes read 0.93x to 1.07x of the tree before over four runs): compare them over several runs. Criterion medians are in README.md and benches/README.md.
+
+## How to measure
+
+- Cycles, instructions and branch misses per byte, not time: `perf stat -x, -e cycles:u,instructions:u,branch-misses:u` (perf from `nix-shell -p perf`) over a binary running one call N times, at N and 2N, the difference over N times the size, pinned with `taskset -c 13` (its sibling is 29; check both idle with `ps -eo psr,pcpu,comm`). Start fuzzers and builds pinned away (`taskset -c 2-11`), and never build or run perf while criterion runs. Other sessions share the machine: compare the tree with the tree before in the same run, row by row, and trust the ratios over the absolute numbers.
+- The harness, in a scratch crate depending on the tree, on a copy of the tree before the session (`git archive HEAD src Cargo.toml`, package renamed `qpref`, `[[bench]]` and dev-dependencies dropped), on encodify `=1.0.2` and on simd-cpu with its `std` feature, all simd-cpu sources patched to ../simd-cpu (`[patch."https://github.com/pimalaya/simd-cpu"]`) so that both trees share one `SimdCpu`: `qpbench <qp|qpp|ref|refp|enc> <encode|decode> <ascii|accented|binary> <size> <iters> [src offset] [dst offset]`, `qp` and `ref` the detected backend of each tree, `qpp` and `refp` the portable one (`QuotedPrintableCpu::new(SimdCpu::NONE)`), inputs generated as benches/compare.rs does, buffers at those offsets from a page boundary. The differential fuzzer `qpdiff <bodies> <a|p> [seed]` checks one backend of the tree against the portable backend of `qpref`: random bodies over the bytes that matter (runs of blanks, of `x`, soft breaks, random bytes), every encode mode and both line endings against the one-shot calls, decoding raw and encoded bodies, random chunks with 1 to 300 bytes of room; its release profile keeps debug assertions and overflow checks. This session's copies are in /tmp/claude-1000/-home-soywod-code-pimalaya/a7f1ec4e-6c93-4ec9-8129-1ba764694c23/scratchpad while /tmp lasts: build.sh (both bench builds and the fuzzer; `NOFUZZ=1` skips the fuzzer), pstat.sh (one row), table.sh (rows by `LIBS`, `OPS`, `KINDS`, `SIZES`, `PAIRS`, `T=target-aligned`), cmp.sh (the tree against the tree before, row by row, with the ratio), summary.pl (the table above from two table.sh outputs), dis.sh (the disassembly of the first symbol matching a pattern), loc.sh (the line count), crit.sh (three criterion runs), crit.pl, readme_tables.pl and bench_tables.pl (criterion medians to the READMEs' tables), ops/ (instruction timings in `asm!` loops), aarch64/shell.nix (fenix at the flake.lock revision with the aarch64 musl target and qemu), base-*.txt and fin-*.txt (the tables before and after this pass).
+- Build the harness twice, plain and with `RUSTFLAGS='-C llvm-args=-align-all-functions=6 -C llvm-args=-align-loops=64'` into another target directory, and read both after every edit.
+- The 64-byte and 4 KiB rows count instructions (Zen 5 memorizes the branch history of an input repeated up to about 64 KiB), the 1 MiB rows count mispredictions; the AVX-512 kernels have none, so their 1 MiB rows follow their 4 KiB ones.
+- The offset pairs matter (4K aliasing between a chunk's loads and the stores before): average the eight pairs, and look at pair 0,0 alone when a small row moves.
+- Correctness: `cargo test` in release and debug runs every test under every backend the CPU has (`cpu::available`), and the frozen corpus hash under each; run `qpdiff 300000 a` and `qpdiff 300000 p` before keeping a change, the tests once with `RUSTFLAGS='-C target-cpu=native'`, and clippy and the release tests for aarch64-unknown-linux-musl in aarch64/shell.nix (`QEMU_CPU=neoverse-n1`; clippy with `-D warnings` caught an import only the x86_64 arm used).
+- criterion (`cargo bench --bench compare`, pinned) is what the READMEs publish: the median of three full runs.
+- Assembly: `objdump -d --no-show-raw-insn -M intel` (binutils from `nix-shell -p binutils`) on the harness binary; `perf record` and `perf annotate --stdio -s <symbol>` show where a loop stalls (the instruction after a stall takes its samples); `perf stat -M PipelineL1,PipelineL2` splits retiring from backend-bound slots; `ls_stlf` counts store-to-load forwards, which spills show up as.
+
+## Where the time goes
+
+- AVX-512 text encoding: about 250 instructions a chunk of 63 bytes (84 a group), 18 of them stack accesses: three masks a chunk, `pdep` of each per group, two `pext`, the soft-break and column logic (about 20), three stores, and the next chunk's classification held in registers across the groups. Binary encoding: about 160 a chunk (53 a group). The column is a chain of about 7 cycles a group (`room`, `bzhi`, `and`, `lzcnt`, `lea`, two selects), so 0.33 cycles a byte is the bound of this design.
+- AVX-512 decoding: about 130 instructions a block of 64 encoded bytes: 16 compares, 4 `vpermb`, a compress, about 12 mask moves to GPRs; compares and mask operations each have two pipes on this Zen 5, which bound a block near 12 to 15 cycles where it takes about 25.
+- The 64-byte rows: a call costs about 350 instructions before its second group of 21 in either backend (harness, prologue, the constants, the partial chunk); a 64-byte input is a full chunk and a one-byte partial chunk when encoding, two blocks when decoding (66 encoded bytes).
+- The portable backend is the pass before's: its 1 MiB rows count mispredictions at block-loop exits (33 to 80 a KiB).
+
+## Levers left
+
+Ordered by expected gain, each to be measured before it is kept:
+
+1. Text encoding: fewer live values across the groups (the next chunk's three masks and three vectors stay live, with the codec's state), a shorter column chain, or groups whose cut logic does not need the line feeds in output space; binary shows the floor of this design is near 0.46 cycles a byte.
+2. An AVX2 backend, for the x86 CPUs without AVX-512 (Intel client CPUs since Alder Lake, Zen 2 and 3): decoding with 32-byte blocks, `vpshufb` lookups and a compress through a table of shuffles indexed by 8-bit masks (simdprune); encoding with the three-lane spread over 128-bit lanes. Weigh its lines against the portable rows it replaces.
+3. A NEON backend for aarch64 (Apple, Graviton): `tbl` lookups, no compress instruction; the aarch64 suite runs under qemu in aarch64/shell.nix, a measure of the portable backend there was never made.
+4. Decoding: the mask pipes (16 compares and 12 mask moves a block); the bytes one and two on from mask shifts, where the shifted loads only serve the compares.
+5. The 64-byte rows: a cheaper prologue in both directions; encoding ASCII at 64 bytes still runs the portable walk through `wide`, which costs a 64-byte masked load and a count.
+6. Size: 786 lines. Candidates measured and refused are in the log; untried: `tokens` and the portable walks, which no pass has shortened since the lean pass.
+7. Miri on the portable backend (it has no unsafe code), fuzz targets, and the Q and DKIM modes (ask the user first: they may belong to another crate).
+
+## Traps
+
+- LLVM fuses permutes from several sources into `vpermt2b` (0.8 a cycle here against 2 for `vpermb`): load shuffle tables opaque (`core::hint::black_box`) where the fused form is slower, and check the assembly for `vpermt2b`.
+- A loop whose iterations each wait on a chain of a few cycles (the column) stalls the next iteration's head when most of its operations wait on that chain: read the next chunk ahead in program order, behind a predicted branch; a select on the address (`read + 63 * more`) made the load wait and lost the gain.
+- What a read-ahead carries stays live across the iteration: carry few values (the decoder's first version carried seven masks and spilled 51 times); pass what the next scan needs into it rather than out of it.
+- LLVM turns a `match` or `if` chain on the data into branches: `core::hint::select_unpredictable` keeps a select (stable since Rust 1.88); its arms are both evaluated, so they must not overflow in debug builds (`wrapping_sub`, `63 ^ lz`).
+- Masked loads cost a mask computation and a GPR-to-mask move each (1 a cycle): 24 instructions a chunk in the encoder, 15% in the decoder; keep the unmasked path for whole blocks.
+- Run-time values the kernels use in every group (the soft break, its length, the CRLF test) take registers: as const generics they became immediates.
+- A `#[cfg]` match arm leaves what only it uses unused on other targets: run clippy for aarch64 too.
+- Editing with `perl -0pi -e 's{...}{...}'` breaks on braces and `//` in the replacement: write the new text to a file and splice it with a `BEGIN` block, or use the Edit tool; a failed substitution in a `&&` chain skipped the file write and a later one replaced a dispatch arm with nothing (restored from a copy).
+- Every trap of the passes before still holds (the archived the-wider-reach and the-wide-blocks): data-dependent cursors serialize blocks, per-group lengths at run time cost 20% to 40%, a closure with two call sites can go out of line (check `nm -C` for `{closure#`), masked loads past the slice end use `wrapping_add`, `vpcompressb` to memory is slow on Zen 4.

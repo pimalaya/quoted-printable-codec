@@ -17,9 +17,16 @@ impl QuotedPrintableCpu {
     /// The AVX-512 backend when `cpu` has AVX-512 VBMI and VBMI2, BMI1, BMI2,
     /// LZCNT and POPCNT, the portable one otherwise.
     pub const fn new(cpu: SimdCpu) -> Self {
-        Self {
-            backend: widest(cpu),
-        }
+        use simd_cpu::SimdFeature::{Avx512Vbmi, Avx512Vbmi2, Bmi1, Bmi2, Lzcnt, Popcnt};
+
+        let avx512 = cpu.has(Avx512Vbmi2) && cpu.has(Avx512Vbmi) && cpu.has(Popcnt);
+        let backend = match avx512 && cpu.has(Bmi1) && cpu.has(Bmi2) && cpu.has(Lzcnt) {
+            #[cfg(target_arch = "x86_64")]
+            true => QuotedPrintableBackend::Avx512,
+            _ => QuotedPrintableBackend::Portable,
+        };
+
+        Self { backend }
     }
 
     /// The backend this token names.
@@ -55,28 +62,6 @@ pub enum QuotedPrintableBackend {
     /// BMI2.
     #[cfg(target_arch = "x86_64")]
     Avx512,
-}
-
-#[cfg(target_arch = "x86_64")]
-const fn widest(cpu: SimdCpu) -> QuotedPrintableBackend {
-    use simd_cpu::SimdFeature::{Avx512Vbmi, Avx512Vbmi2, Bmi1, Bmi2, Lzcnt, Popcnt};
-
-    if cpu.has(Avx512Vbmi2)
-        && cpu.has(Avx512Vbmi)
-        && cpu.has(Bmi1)
-        && cpu.has(Bmi2)
-        && cpu.has(Lzcnt)
-        && cpu.has(Popcnt)
-    {
-        QuotedPrintableBackend::Avx512
-    } else {
-        QuotedPrintableBackend::Portable
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-const fn widest(_: SimdCpu) -> QuotedPrintableBackend {
-    QuotedPrintableBackend::Portable
 }
 
 /// The backends the running CPU supports, portable first.

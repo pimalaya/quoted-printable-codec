@@ -1,8 +1,8 @@
 # Benchmarks
 
-[criterion](https://crates.io/crates/criterion) medians of `cargo bench --bench compare` (source in [compare.rs](./compare.rs)), in GiB/s of raw bytes on both sides. Measured on 2026-11-01, rustc 1.99, Linux x86_64 on an AMD Ryzen AI Max+ 395 (Zen 5), pinned to one core with `taskset -c 13`, all groups in one run, on a machine shared with other work. Each cell is the median of three runs; "before" is the published median of the pass before (commit 4f932a9).
+[criterion](https://crates.io/crates/criterion) medians of `cargo bench --bench compare` (source in [compare.rs](./compare.rs)), in GiB/s of raw bytes on both sides. Measured on 2026-11-01, rustc 1.99, Linux x86_64 on an AMD Ryzen AI Max+ 395 (Zen 5), pinned to one core with `taskset -c 13`, all groups in one run, on a machine shared with other work. Each cell is the median of three runs; "before" is the published median of the pass before (commit 72d8dc6, whose code 2c7604e kept).
 
-- quoted-printable-codec 0.0.1: the AVX-512 backend `QuotedPrintableCpu::new(SimdCpu::detect())` picks on this CPU, blocks of 64 bytes with the VBMI2 byte compress and no branch on the data; short text with few bytes to escape goes through the portable walk.
+- quoted-printable-codec 0.0.1: the AVX-512 backend `QuotedPrintableCpu::new(SimdCpu::detect())` picks on this CPU, blocks of 64 bytes with the VBMI2 byte compress, no branch on the data and each block read ahead; short text with few bytes to escape goes through the portable walk.
 - encodify 1.0.2: `qp::BODY` (and `qp::BINARY` to encode binary), into a slice; it runs AVX2 here.
 - quoted_printable 0.5.2: `encode`, `encode_binary` and `decode` in `ParseMode::Robust`; they allocate their output, as their API asks.
 - mail-parser 0.11.9: `decoders::quoted_printable::quoted_printable_decode`, decoding only; it allocates its output.
@@ -13,63 +13,63 @@ Inputs: ascii is lowercase words with a few `.`, `,` and `=`, in CRLF lines of a
 
 | input | before | quoted-printable-codec | encodify | quoted_printable |
 | --- | --- | --- | --- | --- |
-| ascii, 64 B | 3.768 | 3.620 | 2.251 | 0.617 |
-| ascii, 4 KiB | 3.993 | 4.260 | 2.221 | 0.727 |
-| ascii, 1 MiB | 1.919 | 3.530 | 0.994 | 0.570 |
-| ascii, 10 MiB | 1.723 | 4.373 | 1.042 | 0.576 |
-| accented, 64 B | 1.394 | 2.051 | 0.967 | 0.395 |
-| accented, 4 KiB | 1.606 | 4.374 | 1.082 | 0.481 |
-| accented, 1 MiB | 0.923 | 4.444 | 0.427 | 0.304 |
-| accented, 10 MiB | 0.945 | 4.398 | 0.421 | 0.306 |
-| binary, 64 B | 1.208 | 2.681 | 0.643 | 0.237 |
-| binary, 4 KiB | 1.328 | 5.960 | 0.682 | 0.259 |
-| binary, 1 MiB | 0.857 | 5.526 | 0.201 | 0.156 |
-| binary, 10 MiB | 0.913 | 4.225 | 0.201 | 0.146 |
+| ascii, 64 B | 3.620 | 3.653 | 2.338 | 0.649 |
+| ascii, 4 KiB | 4.260 | 5.642 | 2.295 | 0.750 |
+| ascii, 1 MiB | 3.530 | 5.763 | 1.045 | 0.580 |
+| ascii, 10 MiB | 4.373 | 5.760 | 1.033 | 0.585 |
+| accented, 64 B | 2.051 | 2.156 | 0.987 | 0.393 |
+| accented, 4 KiB | 4.374 | 5.720 | 1.087 | 0.494 |
+| accented, 1 MiB | 4.444 | 5.771 | 0.427 | 0.308 |
+| accented, 10 MiB | 4.398 | 5.747 | 0.423 | 0.306 |
+| binary, 64 B | 2.681 | 2.873 | 0.648 | 0.246 |
+| binary, 4 KiB | 5.960 | 9.460 | 0.688 | 0.258 |
+| binary, 1 MiB | 5.526 | 9.584 | 0.217 | 0.158 |
+| binary, 10 MiB | 4.225 | 9.139 | 0.217 | 0.145 |
 
 ## Decoding
 
 | input | before | quoted-printable-codec | encodify | quoted_printable | mail-parser |
 | --- | --- | --- | --- | --- | --- |
-| ascii, 64 B | 2.492 | 3.415 | 2.746 | 0.270 | 0.955 |
-| ascii, 4 KiB | 4.897 | 9.849 | 2.589 | 0.581 | 1.220 |
-| ascii, 1 MiB | 1.881 | 10.114 | 1.181 | 0.472 | 0.523 |
-| ascii, 10 MiB | 1.839 | 9.806 | 1.158 | 0.476 | 0.509 |
-| accented, 64 B | 1.294 | 3.430 | 1.046 | 0.206 | 0.921 |
-| accented, 4 KiB | 1.650 | 6.811 | 1.117 | 0.403 | 1.062 |
-| accented, 1 MiB | 0.916 | 6.960 | 0.463 | 0.276 | 0.375 |
-| accented, 10 MiB | 0.910 | 7.134 | 0.458 | 0.274 | 0.372 |
-| binary, 64 B | 0.799 | 2.539 | 0.749 | 0.159 | 0.717 |
-| binary, 4 KiB | 0.888 | 4.650 | 0.727 | 0.256 | 0.822 |
-| binary, 1 MiB | 0.650 | 4.762 | 0.235 | 0.156 | 0.260 |
-| binary, 10 MiB | 0.640 | 4.669 | 0.239 | 0.148 | 0.247 |
+| ascii, 64 B | 3.415 | 3.359 | 2.794 | 0.332 | 1.260 |
+| ascii, 4 KiB | 9.849 | 10.855 | 2.601 | 0.589 | 1.313 |
+| ascii, 1 MiB | 10.114 | 11.867 | 1.199 | 0.487 | 0.534 |
+| ascii, 10 MiB | 9.806 | 10.417 | 1.172 | 0.475 | 0.527 |
+| accented, 64 B | 3.430 | 3.368 | 1.070 | 0.206 | 0.933 |
+| accented, 4 KiB | 6.811 | 7.446 | 1.142 | 0.412 | 1.009 |
+| accented, 1 MiB | 6.960 | 7.621 | 0.469 | 0.272 | 0.377 |
+| accented, 10 MiB | 7.134 | 7.197 | 0.466 | 0.272 | 0.372 |
+| binary, 64 B | 2.539 | 2.518 | 0.751 | 0.155 | 0.683 |
+| binary, 4 KiB | 4.650 | 5.431 | 0.737 | 0.259 | 0.772 |
+| binary, 1 MiB | 4.762 | 5.508 | 0.243 | 0.154 | 0.250 |
+| binary, 10 MiB | 4.669 | 4.733 | 0.242 | 0.143 | 0.246 |
 
 ## Cycle counts
 
-Cycles per byte of raw input from `perf stat`, averaged over eight placements of the source and output buffers, for both backends of this tree, the pass before (commit 4f932a9) and encodify; cairn/changes/the-wider-reach/proposal.md has them for two code layouts, with instructions and mispredictions. The portable backend is what runs on a CPU without AVX-512 VBMI2.
+Cycles per byte of raw input from `perf stat`, averaged over eight placements of the source and output buffers, for both backends of this tree, the AVX-512 backend of the tree before (commit 2c7604e) and encodify; cairn/changes/the-column-chain/proposal.md has them for two code layouts, with instructions and mispredictions. The portable backend is what runs on a CPU without AVX-512 VBMI2.
 
 | workload | AVX-512 | portable | before | encodify |
 | --- | --- | --- | --- | --- |
-| encode ascii, 64 B | 1.22 | 1.18 | 1.17 | 1.96 |
-| encode ascii, 4 KiB | 1.02 | 1.11 | 1.14 | 1.97 |
-| encode ascii, 1 MiB | 1.02 | 2.18 | 2.18 | 4.37 |
-| encode accented, 64 B | 2.23 | 3.00 | 3.08 | 4.82 |
-| encode accented, 4 KiB | 0.98 | 2.59 | 2.57 | 4.25 |
-| encode accented, 1 MiB | 1.00 | 4.17 | 4.22 | 10.92 |
-| encode binary, 64 B | 1.68 | 3.07 | 3.53 | 7.37 |
-| encode binary, 4 KiB | 0.74 | 3.18 | 3.20 | 6.69 |
-| encode binary, 1 MiB | 0.77 | 4.34 | 4.56 | 20.69 |
-| decode ascii, 64 B | 1.24 | 1.14 | 1.20 | 1.72 |
-| decode ascii, 4 KiB | 0.45 | 0.85 | 0.90 | 1.72 |
-| decode ascii, 1 MiB | 0.42 | 2.00 | 2.32 | 3.71 |
-| decode accented, 64 B | 1.25 | 3.28 | 3.47 | 4.34 |
-| decode accented, 4 KiB | 0.63 | 2.56 | 2.65 | 3.92 |
-| decode accented, 1 MiB | 0.62 | 4.41 | 4.78 | 9.53 |
-| decode binary, 64 B | 1.56 | 5.61 | 5.84 | 6.02 |
-| decode binary, 4 KiB | 0.94 | 4.67 | 4.96 | 6.05 |
-| decode binary, 1 MiB | 0.92 | 6.54 | 6.79 | 18.61 |
+| encode ascii, 64 B | 1.19 | 1.15 | 1.27 | 1.99 |
+| encode ascii, 4 KiB | 0.78 | 1.12 | 1.00 | 1.97 |
+| encode ascii, 1 MiB | 0.77 | 2.18 | 1.00 | 4.20 |
+| encode accented, 64 B | 2.08 | 3.03 | 2.18 | 4.69 |
+| encode accented, 4 KiB | 0.79 | 2.59 | 0.98 | 4.25 |
+| encode accented, 1 MiB | 0.77 | 4.18 | 1.00 | 10.59 |
+| encode binary, 64 B | 1.51 | 3.46 | 1.73 | 7.37 |
+| encode binary, 4 KiB | 0.46 | 3.23 | 0.74 | 6.66 |
+| encode binary, 1 MiB | 0.46 | 4.36 | 0.77 | 21.00 |
+| decode ascii, 64 B | 1.32 | 1.21 | 1.27 | 1.71 |
+| decode ascii, 4 KiB | 0.43 | 0.84 | 0.45 | 1.73 |
+| decode ascii, 1 MiB | 0.38 | 2.02 | 0.43 | 3.72 |
+| decode accented, 64 B | 1.28 | 3.33 | 1.39 | 4.27 |
+| decode accented, 4 KiB | 0.61 | 2.58 | 0.66 | 3.90 |
+| decode accented, 1 MiB | 0.54 | 4.47 | 0.64 | 9.55 |
+| decode binary, 64 B | 1.56 | 5.84 | 1.60 | 6.00 |
+| decode binary, 4 KiB | 0.82 | 4.78 | 0.91 | 6.04 |
+| decode binary, 1 MiB | 0.81 | 6.60 | 0.90 | 18.39 |
 
 ## Where it stands
 
-Ahead of every other library in every row. The AVX-512 backend decodes 2x to 8x faster than the pass before from 4 KiB up, and 1.4x to 3.2x at 64 bytes; it encodes 1.8x to 6.4x faster from 1 MiB up and up to 4.5x at 4 KiB. Encoding ASCII at 64 bytes is level with the pass before (4% lower here, level by cycle counts), as it runs the same portable walk. Its kernels never branch on the data, so the 1 MiB and 10 MiB rows keep the speed of the 4 KiB ones, where the walk over special bytes mispredicts at the end of every block; it also makes their cells steady between runs, within 10% at 64 bytes and 4 KiB where the pass before moved by up to 2x.
+Ahead of every other library in every row. The AVX-512 backend encodes 1.3x to 1.6x faster than the pass before from 4 KiB up on text and 1.6x to 2.2x on binary, as each chunk builds the bytes an escape takes once and reads the next chunk ahead of the soft-break logic of this one; it decodes 1.09x to 1.17x faster from 4 KiB to 1 MiB, each block scanned ahead of the one it cuts, and 1.01x to 1.06x at 10 MiB. The 64-byte cells are level with the pass before: the encoding ones 1% to 7% higher, the decoding ones 1% to 2% lower, within the 5% to 11% the decoding cells moved between runs; by cycle counts too, the 64-byte rows are level or ahead within the 5% to 7% they move between runs.
 
-The portable backend decodes up to 1.16x faster than the pass before (ASCII at 1 MiB), level with it on binary at 64 bytes, and encodes as fast.
+The portable backend is the pass before's.

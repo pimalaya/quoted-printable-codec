@@ -1,24 +1,28 @@
 //! # AVX-512 backend
 //!
-//! Blocks of 64 bytes with the VBMI2 byte compress, no branch on the data.
-//! Decoding reads every escape of a block at once, from the block loaded
-//! again one and two bytes on, and compresses the digits and soft breaks
-//! away. Encoding spreads each byte of a group of 21 over three lanes, its
-//! escape's, compresses away the lanes it does not use, and finds the one
-//! soft break a group may need from masks moved to the output by `pext`.
+//! Blocks of 64 bytes with the VBMI2 byte compress, no branch on the data,
+//! each block read ahead while the one before is finished. Decoding reads
+//! every escape of a block at once, from the block loaded again one and two
+//! bytes on, and compresses the digits and soft breaks away. Encoding builds
+//! the bytes each byte of a chunk may take once, spreads each group of 21
+//! over the three lanes of its escape, compresses away the lanes it does not
+//! use, and finds the one soft break a group may need from masks moved to
+//! the output by `pext`.
 
-use core::arch::x86_64::*;
+use core::{arch::x86_64::*, hint::select_unpredictable};
 
 use crate::{
-    codec::QuotedPrintableCodec,
+    codec::QuotedPrintableEol,
     encode::{LINE, ROOM},
     is_blank,
 };
 
 /// For the low 6 bits of each hex digit: the digit, its value shifted high
-/// and its value; elsewhere a byte with other low bits.
-static DIGITS: [[u8; 64]; 3] = {
-    let mut table = [[0; 64]; 3];
+/// and its value, elsewhere a byte with other low bits; then, for each of the
+/// three groups of an encoding chunk, the byte each lane takes, three lanes a
+/// byte; and the hex digit of each low nibble.
+static TABLES: [[u8; 64]; 7] = {
+    let mut table = [[0; 64]; 7];
     let mut i = 0;
 
     while i < 64 {
@@ -27,23 +31,10 @@ static DIGITS: [[u8; 64]; 3] = {
             low @ (0x01..=0x06 | 0x21..=0x26) => [low | 0x40, (low & 7) + 9],
             low => [low ^ 1, 0],
         };
+        let spread = (i / 3) as u8;
         [table[0][i], table[1][i], table[2][i]] = [byte, value << 4, value];
-        i += 1;
-    }
-
-    table
-};
-
-/// For each of the three groups of a chunk, the byte each lane takes, three
-/// lanes a byte; then the hex digits.
-static SPREAD: [[u8; 64]; 4] = {
-    let mut table = [[0; 64]; 4];
-    let mut i = 0;
-
-    while i < 64 {
-        let byte = (i / 3) as u8;
-        [table[0][i], table[1][i], table[2][i]] = [byte, byte + 21, byte + 42];
-        table[3][i] = b"0123456789ABCDEF"[i % 16];
+        [table[3][i], table[4][i], table[5][i]] = [spread, spread + 21, spread + 42];
+        table[6][i] = b"0123456789ABCDEF"[i % 16];
         i += 1;
     }
 
@@ -58,14 +49,16 @@ const STARTS: u64 = 0x1249_2492_4924_9249;
 /// `prev` tells whether a space or tab comes before `src`.
 #[target_feature(enable = "avx512vbmi2,avx512vbmi,bmi1,bmi2,lzcnt,popcnt")]
 pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
-    let [check, high, low] = DIGITS.map(|table| load(&table));
+    let [check, high, low, ..] = TABLES.map(|table| load(&table));
     let mut read = 0;
     let mut written = 0;
-    let mut carry = 0;
-    let mut prev = prev as u64;
     let mut bad = 0;
 
-    while read < src.len() {
+    // The block from `read`, its escapes decoded, and its masks: the digits
+    // and soft breaks, `carry` the lanes the last block's run over, the bytes
+    // the token steps decide, `prev` telling whether a blank comes before,
+    // the bytes that are not clean, and what the next block takes over.
+    let scan = |read: usize, carry: u64, prev: u64| {
         let rest = src.len() - read;
         let at = src.as_ptr().wrapping_add(read);
         // SAFETY: 66 bytes are left from `at`, or the masks cover the bytes
@@ -89,35 +82,36 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
         let soft = eq & lfb;
         let crlf = eq & is(b, b'\r') & is(c, b'\n');
         let spans = esc | crlf;
-        // NOTE: the digits and soft breaks of this block, and the bytes of
-        // this one the last block's run over.
         let gone = (spans | soft) << 1 | spans << 2 | soft | crlf | carry;
         let slow = cr & !lfb | (blank << 1 | prev) & (cr | lf) | eq & !(spans | soft);
-        let valid = first(rest);
-        let stop = (slow & valid).trailing_zeros() as usize;
-        let done = _bzhi_u64(valid, stop as u32);
-        let keep = done & !gone;
         let lower = _mm512_cmpge_epu8_mask(a, splat(0x60)) & gone;
-        bad |= (lower | !(plain(a) | eq | cr | lf)) & done;
-
         let value = _mm512_or_si512(
             _mm512_permutexvar_epi8(b, high),
             _mm512_permutexvar_epi8(c, low),
         );
-        let out = _mm512_maskz_compress_epi8(keep, _mm512_mask_blend_epi8(esc, a, value));
-        let count = keep.count_ones() as usize;
+        let out = _mm512_mask_blend_epi8(esc, a, value);
+        let text = _mm512_cmplt_epu8_mask(_mm512_sub_epi8(a, splat(b' ')), splat(0x5f));
+        let next = [(spans | soft) >> 63 | spans >> 62, blank >> 63];
+        (out, [gone, slow, lower | !(text | tab | cr | lf)], next)
+    };
+
+    // NOTE: the next block is scanned ahead, while this one is cut where it
+    // stops.
+    let mut next = (read < src.len()).then(|| scan(read, 0, prev as u64));
+
+    while let Some((out, [gone, slow, flags], [carry, prev])) = next {
+        let rest = src.len() - read;
+        next = (rest > 64).then(|| scan(read + 64, carry, prev));
+        let valid = first(rest);
+        let stop = (slow & valid).trailing_zeros() as usize;
+        let done = _bzhi_u64(valid, stop as u32);
+        let keep = done & !gone;
+        bad |= flags & done;
+        let out = _mm512_maskz_compress_epi8(keep, out);
         let to = dst.as_mut_ptr().wrapping_add(written);
-
-        // SAFETY: `dst` has at least as many bytes left as `src`, so 64 when
-        // the block is whole, else `count`.
-        unsafe {
-            match valid {
-                u64::MAX => _mm512_storeu_si512(to.cast(), out),
-                _ => _mm512_mask_storeu_epi8(to.cast(), first(count), out),
-            }
-        }
-
-        written += count;
+        // SAFETY: `dst` has at least as many bytes left as `src`.
+        unsafe { _mm512_mask_storeu_epi8(to.cast(), valid, out) };
+        written += keep.count_ones() as usize;
 
         if stop < 64 || rest <= 64 {
             read += stop.min(rest);
@@ -125,8 +119,6 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
         }
 
         read += 64;
-        carry = (spans | soft) >> 63 | spans >> 62;
-        prev = blank >> 63;
     }
 
     *dirty |= bad != 0;
@@ -136,93 +128,102 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
 /// Encodes `src` into `dst` from `column` in chunks of three groups of 21
 /// bytes, as many as fit, as the portable walk does.
 #[target_feature(enable = "avx512vbmi2,avx512vbmi,bmi1,bmi2,lzcnt,popcnt")]
-pub(crate) fn encode<const TEXT: bool>(
+pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
-    codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    let (soft, soft_len) = codec.eol.soft_break();
-    let crlf = (TEXT && soft_len == 3) as u64;
-    let [spreads @ .., hex] = SPREAD.map(|table| load(&table));
+    let eol = [QuotedPrintableEol::Lf, QuotedPrintableEol::Crlf][CRLF as usize];
+    let (soft, soft_len) = eol.soft_break();
+    let crlf = TEXT && CRLF;
+    let base = dst.as_mut_ptr();
+    // NOTE: loaded opaque, as LLVM would fuse the three spreads of a group
+    // into two two-table permutes, slower on Zen 5.
+    let [_, _, _, spreads @ .., hex] = core::hint::black_box(&TABLES).each_ref().map(|t| load(t));
     let mut read = 0;
     let mut written = 0;
     let mut col = *column;
 
-    // The bytes of `a` to escape, its line feeds and the CRs they drop;
-    // `next` tells whether a line feed follows the last lane, `end` holds
-    // the input's last byte.
-    let masks = |a, next: bool, end: u64| {
-        let is = |byte| _mm512_cmpeq_epi8_mask(a, splat(byte));
-        let tab = is(b'\t');
-        let blank = is(b' ') | tab;
-        let esc = !plain(a) | blank & end;
+    // The first, second and third byte each byte of `a` takes, and the bytes
+    // to escape, the line feeds and the CRs they drop; `b` holds the bytes one
+    // on, `end` the input's last byte.
+    let bytes = |a, b, end: u64| {
+        let is = |v, byte| _mm512_cmpeq_epi8_mask(v, splat(byte));
+        let blank = is(a, b' ') | is(a, b'\t');
+        let [mut esc, mut lf, mut drop] = [!plain(a) | blank & end, 0, 0];
 
-        match TEXT {
-            true => {
-                let [cr, lf] = [is(b'\r'), is(b'\n')];
-                let lf1 = lf >> 1 | (next as u64) << 63;
-                let drop = cr & lf1;
-                let brk = lf1 | cr >> 1 & (lf >> 2 | (next as u64) << 62);
-                [esc & !lf & !drop | blank & brk, lf, drop]
-            }
-            false => [esc, 0, 0],
+        if TEXT {
+            let lf1 = is(b, b'\n');
+            lf = is(a, b'\n');
+            drop = is(a, b'\r') & lf1;
+            esc = esc & !lf & !drop | blank & (lf1 | is(b, b'\r') & lf1 >> 1);
         }
+
+        let set = |v, mask, byte| _mm512_mask_mov_epi8(v, mask, splat(byte));
+        let high = _mm512_permutexvar_epi8(_mm512_srli_epi16(a, 4), hex);
+        let lead = set(set(a, esc, b'='), lf, if crlf { b'\r' } else { b'\n' });
+        let low = _mm512_permutexvar_epi8(a, hex);
+        ([lead, set(high, lf, b'\n'), low], [esc, lf, drop])
     };
 
-    // Encodes the `n` bytes of `a` the lanes of `spread` take, of the masks
-    // `masks`, to `to`, returning the bytes written.
-    let mut group = |a, spread, [esc, lf, drop]: [u64; 3], n: usize, to: *mut u8| {
-        let starts = _bzhi_u64(STARTS, 3 * n as u32);
-        let [escs, lfs, drops] = [esc, lf, drop].map(|mask| _pdep_u64(mask, STARTS));
-        let crs = lfs & crlf.wrapping_neg();
-        let keep = starts & !drops | (escs | crs) << 1 | escs << 2;
-
-        let bytes = _mm512_permutexvar_epi8(spread, a);
-        let nibbles = _mm512_mask_blend_epi8(
-            STARTS << 1,
-            _mm512_and_si512(bytes, splat(0x0f)),
-            _mm512_and_si512(_mm512_srli_epi16(bytes, 4), splat(0x0f)),
-        );
-        let out = _mm512_mask_blend_epi8(STARTS, _mm512_permutexvar_epi8(nibbles, hex), bytes);
-        let out = _mm512_mask_mov_epi8(out, escs, splat(b'='));
-        let out = _mm512_mask_mov_epi8(out, crs, splat(b'\r'));
-        let out = _mm512_mask_mov_epi8(out, crs << 1, splat(b'\n'));
+    // Encodes the first `n` bytes of the masks `masks`, which the lanes of
+    // `spread` take from `bytes`, at `at` in `dst`, returning the bytes
+    // written.
+    let mut group = |[lead, high, low]: [__m512i; 3], spread, masks: [u64; 3], n: usize, at| {
+        let [escs, lfs, drops] = masks.map(|mask| _pdep_u64(mask, STARTS));
+        let starts = _bzhi_u64(STARTS, 3 * n as u32) & !drops;
+        let keep = starts | (escs | if crlf { lfs } else { 0 }) << 1 | escs << 2;
+        let out = _mm512_permutexvar_epi8(spread, lead);
+        let out = _mm512_mask_permutexvar_epi8(out, STARTS << 1, spread, high);
+        let out = _mm512_mask_permutexvar_epi8(out, STARTS << 2, spread, low);
         let out = _mm512_maskz_compress_epi8(keep, out);
         let len = keep.count_ones() as usize;
 
-        // NOTE: a literal past the line's room, or an escape running past
-        // it, takes a soft break before it, unless a line break comes first.
-        let [lits, escs, lfs] =
-            [starts & !drops & !escs & !lfs, escs, lfs].map(|mask| _pext_u64(mask, keep));
-        let late = !_bzhi_u64(!0, (LINE - col) as u32);
-        let cuts = (lits & late | escs & late >> 2) & _bzhi_u64(!0, lfs.trailing_zeros());
-        let cut = cuts.trailing_zeros() as usize;
-        let line = lfs << (1 + crlf) | cuts & cuts.wrapping_neg();
+        // NOTE: the literal or escape covering the line's first lane past its
+        // room takes a soft break before it, unless a line break comes first.
+        let [starts, lfs] = [starts, lfs].map(|mask| _pext_u64(mask, keep));
+        let room = LINE - col;
+        let upto = _bzhi_u64(!0, room as u32 + 1);
+        let lz = _lzcnt_u64(starts & upto) as usize;
+        let need = (room < len) & (lfs & upto == 0);
+        let cut = select_unpredictable(need, 63 ^ lz, 64);
+        let to = base.wrapping_add(at);
 
         // SAFETY: 68 bytes are left from `to`, as a chunk has `ROOM`.
         unsafe {
             _mm512_storeu_si512(to.cast(), out);
             to.add(cut).cast::<[u8; 4]>().write_unaligned(soft);
-            _mm512_mask_storeu_epi8(to.add(soft_len).cast(), !first(cut), out);
+            _mm512_mask_storeu_epi8(to.add(soft_len).cast(), !_bzhi_u64(!0, cut as u32), out);
         }
 
-        col = match line {
-            0 => col + len,
-            _ => len + _lzcnt_u64(line) as usize - 63,
-        };
-        len + if cuts != 0 { soft_len } else { 0 }
+        let wrap = select_unpredictable(need, (len + lz).wrapping_sub(63), col + len);
+        let after = (len + _lzcnt_u64(lfs) as usize).wrapping_sub(64 + crlf as usize);
+        col = select_unpredictable(lfs == 0, wrap, after);
+        len + select_unpredictable(need, soft_len, 0)
     };
 
-    while dst.len() - written >= ROOM && src.len() - read >= 65 - last as usize {
-        // SAFETY: 64 bytes are left from `read`.
-        let a = unsafe { _mm512_loadu_si512(src.as_ptr().add(read).cast()) };
-        let masks = masks(a, src.get(read + 64) == Some(&b'\n'), 0);
+    // NOTE: the next chunk is read ahead, while the column runs through the
+    // groups of this one.
+    let full = |read: usize| src.len() - read >= 65 - last as usize;
+    let chunk = |read: usize| {
+        let at = src.as_ptr().wrapping_add(read);
+        // SAFETY: 64 bytes are left from `read`, and the mask covers the bytes
+        // left from `read + 1` only.
+        let [a, b] = unsafe {
+            let b = _mm512_maskz_loadu_epi8(first(src.len() - read - 1), at.add(1).cast());
+            [_mm512_loadu_si512(at.cast()), b]
+        };
+        bytes(a, b, 0)
+    };
+    let mut next = full(read).then(|| chunk(read));
+
+    while let Some((bytes, masks)) = next.filter(|_| dst.len() - written >= ROOM) {
+        next = full(read + 63).then(|| chunk(read + 63));
 
         for (i, spread) in spreads.into_iter().enumerate() {
-            let masks = masks.map(|mask| mask >> (21 * i) & 0x1f_ffff);
-            written += group(a, spread, masks, 21, dst.as_mut_ptr().wrapping_add(written));
+            let masks = masks.map(|mask| mask >> (21 * i));
+            written += group(bytes, spread, masks, 21, written);
         }
 
         read += 63;
@@ -239,14 +240,13 @@ pub(crate) fn encode<const TEXT: bool>(
     }
 
     let len = len.min(63) * (dst.len() - written >= ROOM) as usize;
-
-    // SAFETY: the mask covers the bytes left from `read` only.
-    let a = unsafe { _mm512_maskz_loadu_epi8(first(rest), src.as_ptr().add(read).cast()) };
-    let end = match last && rest <= 64 {
-        true => 1 << rest.saturating_sub(1),
-        false => 0,
-    };
-    let masks = masks(a, src.get(read + 64) == Some(&b'\n'), end);
+    let at = src.as_ptr().wrapping_add(read);
+    // SAFETY: the masks cover the bytes left from `read` only.
+    let [a, b] = [0, 1].map(|i| unsafe {
+        _mm512_maskz_loadu_epi8(first(rest.saturating_sub(i)), at.wrapping_add(i).cast())
+    });
+    let end = (first(rest) ^ first(rest.saturating_sub(1))) & (last as u64).wrapping_neg();
+    let (bytes, masks) = bytes(a, b, end);
 
     for (i, spread) in spreads.into_iter().enumerate() {
         let n = len.saturating_sub(21 * i).min(21);
@@ -256,7 +256,7 @@ pub(crate) fn encode<const TEXT: bool>(
         }
 
         let masks = masks.map(|mask| mask >> (21 * i) & first(n));
-        written += group(a, spread, masks, n, dst.as_mut_ptr().wrapping_add(written));
+        written += group(bytes, spread, masks, n, written);
         read += n;
     }
 

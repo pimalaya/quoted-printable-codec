@@ -17,7 +17,7 @@ Quoted-printable encoder and decoder with SIMD and no_std
 ## Features
 
 - **SIMD**: AVX-512 on x86_64, the backend picked once by the application with a CPU token; safe portable code anywhere else.
-- **Fast**: up to 27x faster than encodify and 35x faster than the quoted_printable crate, see the [benchmarks](#benchmarks).
+- **Fast**: up to 44x faster than encodify and 63x faster than the quoted_printable crate, see the [benchmarks](#benchmarks).
 - **MIME lines**: encodes in lines of at most 76 characters, soft breaks included, ended by CRLF or LF.
 - **Text and binary**: text mode keeps line breaks as hard breaks, binary mode escapes CR and LF like any other byte.
 - **Lenient decoding**: never fails, follows the robust rules of RFC 2045 (lowercase digits, trailing blanks, bare CRs, malformed escapes kept), and reports whether the input was clean.
@@ -48,59 +48,59 @@ The crate ships no examples folder, a whole program adding nothing to a two-call
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **3.42** | **9.85** | **10.11** | **9.81** |
-| [encodify](https://crates.io/crates/encodify) | *(-20%)* **2.75** | *(-74%)* **2.59** | *(-88%)* **1.18** | *(-88%)* **1.16** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-92%)* **0.27** | *(-94%)* **0.58** | *(-95%)* **0.47** | *(-95%)* **0.48** |
-| [mail-parser](https://crates.io/crates/mail-parser) | *(-72%)* **0.95** | *(-88%)* **1.22** | *(-95%)* **0.52** | *(-95%)* **0.51** |
+| **quoted-printable-codec** | **3.36** | **10.86** | **11.87** | **10.42** |
+| [encodify](https://crates.io/crates/encodify) | *(-17%)* **2.79** | *(-76%)* **2.60** | *(-90%)* **1.20** | *(-89%)* **1.17** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-90%)* **0.33** | *(-95%)* **0.59** | *(-96%)* **0.49** | *(-95%)* **0.47** |
+| [mail-parser](https://crates.io/crates/mail-parser) | *(-62%)* **1.26** | *(-88%)* **1.31** | *(-96%)* **0.53** | *(-95%)* **0.53** |
 
 ### Accented decoding
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **3.43** | **6.81** | **6.96** | **7.13** |
-| [encodify](https://crates.io/crates/encodify) | *(-70%)* **1.05** | *(-84%)* **1.12** | *(-93%)* **0.46** | *(-94%)* **0.46** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-94%)* **0.21** | *(-94%)* **0.40** | *(-96%)* **0.28** | *(-96%)* **0.27** |
-| [mail-parser](https://crates.io/crates/mail-parser) | *(-73%)* **0.92** | *(-84%)* **1.06** | *(-95%)* **0.38** | *(-95%)* **0.37** |
+| **quoted-printable-codec** | **3.37** | **7.45** | **7.62** | **7.20** |
+| [encodify](https://crates.io/crates/encodify) | *(-68%)* **1.07** | *(-85%)* **1.14** | *(-94%)* **0.47** | *(-94%)* **0.47** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-94%)* **0.21** | *(-94%)* **0.41** | *(-96%)* **0.27** | *(-96%)* **0.27** |
+| [mail-parser](https://crates.io/crates/mail-parser) | *(-72%)* **0.93** | *(-86%)* **1.01** | *(-95%)* **0.38** | *(-95%)* **0.37** |
 
 ### Binary decoding
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **2.54** | **4.65** | **4.76** | **4.67** |
-| [encodify](https://crates.io/crates/encodify) | *(-71%)* **0.75** | *(-84%)* **0.73** | *(-95%)* **0.23** | *(-95%)* **0.24** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-94%)* **0.16** | *(-94%)* **0.26** | *(-97%)* **0.16** | *(-97%)* **0.15** |
-| [mail-parser](https://crates.io/crates/mail-parser) | *(-72%)* **0.72** | *(-82%)* **0.82** | *(-95%)* **0.26** | *(-95%)* **0.25** |
+| **quoted-printable-codec** | **2.52** | **5.43** | **5.51** | **4.73** |
+| [encodify](https://crates.io/crates/encodify) | *(-70%)* **0.75** | *(-86%)* **0.74** | *(-96%)* **0.24** | *(-95%)* **0.24** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-94%)* **0.15** | *(-95%)* **0.26** | *(-97%)* **0.15** | *(-97%)* **0.14** |
+| [mail-parser](https://crates.io/crates/mail-parser) | *(-73%)* **0.68** | *(-86%)* **0.77** | *(-95%)* **0.25** | *(-95%)* **0.25** |
 
 ### ASCII encoding
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **3.62** | **4.26** | **3.53** | **4.37** |
-| [encodify](https://crates.io/crates/encodify) | *(-38%)* **2.25** | *(-48%)* **2.22** | *(-72%)* **0.99** | *(-76%)* **1.04** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-83%)* **0.62** | *(-83%)* **0.73** | *(-84%)* **0.57** | *(-87%)* **0.58** |
+| **quoted-printable-codec** | **3.65** | **5.64** | **5.76** | **5.76** |
+| [encodify](https://crates.io/crates/encodify) | *(-36%)* **2.34** | *(-59%)* **2.29** | *(-82%)* **1.04** | *(-82%)* **1.03** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-82%)* **0.65** | *(-87%)* **0.75** | *(-90%)* **0.58** | *(-90%)* **0.58** |
 
 ### Accented encoding
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **2.05** | **4.37** | **4.44** | **4.40** |
-| [encodify](https://crates.io/crates/encodify) | *(-53%)* **0.97** | *(-75%)* **1.08** | *(-90%)* **0.43** | *(-90%)* **0.42** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-81%)* **0.40** | *(-89%)* **0.48** | *(-93%)* **0.30** | *(-93%)* **0.31** |
+| **quoted-printable-codec** | **2.16** | **5.72** | **5.77** | **5.75** |
+| [encodify](https://crates.io/crates/encodify) | *(-54%)* **0.99** | *(-81%)* **1.09** | *(-93%)* **0.43** | *(-93%)* **0.42** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-82%)* **0.39** | *(-91%)* **0.49** | *(-95%)* **0.31** | *(-95%)* **0.31** |
 
 ### Binary encoding
 
 | GiB/s | 64 B | 4 KiB | 1 MiB | 10 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| **quoted-printable-codec** | **2.68** | **5.96** | **5.53** | **4.22** |
-| [encodify](https://crates.io/crates/encodify) | *(-76%)* **0.64** | *(-89%)* **0.68** | *(-96%)* **0.20** | *(-95%)* **0.20** |
-| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-91%)* **0.24** | *(-96%)* **0.26** | *(-97%)* **0.16** | *(-97%)* **0.15** |
+| **quoted-printable-codec** | **2.87** | **9.46** | **9.58** | **9.14** |
+| [encodify](https://crates.io/crates/encodify) | *(-77%)* **0.65** | *(-93%)* **0.69** | *(-98%)* **0.22** | *(-98%)* **0.22** |
+| [quoted_printable](https://crates.io/crates/quoted_printable) | *(-91%)* **0.25** | *(-97%)* **0.26** | *(-98%)* **0.16** | *(-98%)* **0.14** |
 
 ### Reading the numbers
 
 - quoted-printable-codec runs its AVX-512 backend here, as `QuotedPrintableCpu::new(SimdCpu::detect())` picks it; on a CPU without AVX-512 VBMI2, its portable backend runs, whose cycle counts are in [benches/README.md](./benches/README.md).
 - ASCII is lowercase words with a few `.`, `,` and `=` in CRLF lines of about 72 characters; accented is the same with about one character in seven a two-byte UTF-8 letter; binary is pseudo-random bytes, encoded in binary mode. Decoding reads quoted-printable-codec's encoding of each, and every decoder gives back the raw bytes.
 - quoted_printable and mail-parser allocate their output, as their APIs ask; mail-parser only decodes.
-- Each cell is the median of three runs: quoted-printable-codec's 64 B and 4 KiB cells moved by up to 10% between runs, the memory-bound 1 MiB and 10 MiB ones by up to 30%.
+- Each cell is the median of three runs: quoted-printable-codec's encoding cells moved by up to 4% between runs, its decoding cells by up to 11%.
 
 History and cycle counts are in [benches/README.md](./benches/README.md).
 

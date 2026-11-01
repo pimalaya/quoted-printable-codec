@@ -1,0 +1,31 @@
+---
+cairn: log
+change: the-wider-reach
+landed: 2026-11-01
+---
+
+# The wider reach
+
+Took over from the handoff of the-wider-reach: 805 lines once the shared token had landed (820 at pass 4), the AVX-512 backend encoding at 1.0 cycle a byte of text and 0.74 of binary, decoding at 0.42 to 0.95. The user asked for the same exercise as the pass before: more speed, less code, free hands, a search online for new methods, a handoff and a commit at the end. No published SIMD quoted-printable codec turned up, as in the pass before. By cycle counts against the pass before, AVX-512 encoding runs 1.23x to 1.30x faster on text and 1.57x to 1.74x on binary from 4 KiB up, decoding 1.05x to 1.19x; the 64-byte rows level with it or ahead, within the 5% to 7% they move between runs (decoding ASCII at 64 bytes read 0.93x to 1.07x of the pass before over four runs); the portable backend is unchanged. The code went from 805 to 786 lines.
+
+What landed:
+
+- Encoding, the bytes each byte takes: per chunk of 63 bytes, three vectors in input space hold the first byte each byte takes (itself, `=`, or the CR or LF of a line break), the second (its high hex digit, or the LF of a CRLF) and the third (its low hex digit); a group of 21 takes them with one `vpermb` and two masked `vpermb` from the three-lane spread tables, where it spread the input and computed nibbles, digits and three masked moves per group. The tables are loaded through `core::hint::black_box`, as LLVM fused the three permutes into two `vpermt2b`, which run at 0.8 a cycle on Zen 5 against 2 for `vpermb`.
+- Encoding, the soft break: the token covering the line's first lane past its room is the highest token start at or below that lane (`lzcnt` under a `bzhi` mask), from two `pext` (token starts, line feeds) where three (literals, escapes, line feeds) fed the earliest-candidate rule; the column update goes through `core::hint::select_unpredictable`, as LLVM had made it branches (4 mispredictions a KiB of text at 1 MiB).
+- Encoding, read ahead: the loop classifies the next chunk (its loads, compares and bytes) before it runs the groups of this one. Each group waits on the column, about 7 cycles, and most scalar operations wait with it; they filled the scheduler, so the next chunk's head (load, compares, mask move, `pdep`, about 18 cycles) never overlapped: binary encoding went from 0.74 to 0.48 cycles a byte with it. The line feeds and CRs one byte on come from a second load, masked to the input, so that the text masks stay in mask registers.
+- Encoding, the line ending as a const generic `CRLF` of the AVX-512 encoder (four monomorphizations): the soft break, its length and the CRLF test became immediates, and the text loop went from 36 to 18 stack accesses a chunk, from 0.84 to 0.78 cycles a byte.
+- Decoding, scan ahead: the next block is scanned (loads, compares, masks, escapes decoded and blended in), the carry and the blank it takes over passed to its scan, before this block is cut where it stops, compressed and stored; one store masked by the block's valid lanes replaces the whole/partial branch; the cleanliness mask is printable, tab, CR or LF, without `plain`'s compare against `=`.
+- Size: the decoder's digit tables and the encoder's spread tables are one `TABLES` builder; the backend choice moved into `QuotedPrintableCpu::new`, its AVX-512 arm under `cfg` (simd-cpu's features exist on every target); the AVX-512 group takes an output offset; the encoder's end-of-input mask comes from `first`.
+
+Tried and left out:
+
+- Encoding: the soft break from compares on the compressed output (`=` and LF lanes) in place of `pext`: the column then waits on the compress and a mask move, binary 1.4x slower. The two-table `vpermt2b` for the bytes. One masked loader for every chunk, the input's end included: 24 instructions a chunk more, binary from 0.48 to 0.57. The density check folded into the AVX-512 encoder, reusing its first chunk: 64-byte ASCII from 1.25 to 1.53 cycles a byte, as the whole chunk is classified before the walk. The read-ahead address as a select (`read + 63 * more`) in place of a branch: binary back to 0.69, the load waiting on the select.
+- Decoding: masked loads for every block, 15% slower, as the pass before found. A first scan ahead carrying seven masks: 51 stack accesses, 47% more instructions, at most 1.14x.
+
+Measured on this Zen 5 with `asm!` loops (cycles): `vpermb` latency 5, 2 a cycle; `vpermt2b` latency 5, 0.8 a cycle; `vpcompressb` and `vpexpandb` to a register 0.8 a cycle, latency 5; `kmovq` mask to GPR 2 a cycle, GPR to mask 1 a cycle, a round trip 9 cycles; compares into masks and `korq` 2 a cycle each; `pdep` latency 3, `pdep` and `pext` about 2 a cycle; `vpblendmb` 4 a cycle; 64-byte stores 1 a cycle, masked or not. Compares, `vpermb` and `vpcompressb` share two pipes, mask operations and `kmovq` two others.
+
+Criterion, the median of three full runs (64 bytes to 10 MiB) against the published medians of the pass before, in GiB/s: encoding ascii at 64 bytes, 4 KiB, 1 MiB and 10 MiB 3.62, 4.26, 3.53, 4.37 before and 3.65, 5.64, 5.76, 5.76 now; accented 2.05, 4.37, 4.44, 4.40 and 2.16, 5.72, 5.77, 5.75; binary 2.68, 5.96, 5.53, 4.23 and 2.87, 9.46, 9.58, 9.14. Decoding ascii 3.42, 9.85, 10.11, 9.81 and 3.36, 10.86, 11.87, 10.42; accented 3.43, 6.81, 6.96, 7.13 and 3.37, 7.45, 7.62, 7.20; binary 2.54, 4.65, 4.76, 4.67 and 2.52, 5.43, 5.51, 4.73. Every cell leads encodify, by 1.2x (decoding ascii at 64 bytes) to 44x (encoding binary at 1 MiB). The decoding cells at 64 bytes read 1% to 2% under the pass before, within the 5% to 11% this crate's decoding cells moved between runs (its encoding cells within 4%).
+
+Checked: the test suite in debug and release with all features, without default features, and in release with `-C target-cpu=native`; clippy with `-D warnings` for all targets and all features and for the library without default features, on x86_64 and on aarch64-unknown-linux-musl; the aarch64 suite in release under qemu-aarch64 on neoverse-n1; rustdoc with `-D warnings`; 700,000 differential fuzz bodies against the tree before (300,000 under each backend, 100,000 more under AVX-512 from another seed); `a_frozen_corpus_keeps_its_output` unchanged under both backends.
+
+Capabilities moved: none; speed and size only.

@@ -164,9 +164,11 @@ fn blocks(
         // SAFETY: the codec's token names the AVX-512 backend, which the CPU
         // supports.
         (true, binary) => unsafe {
-            match binary {
-                true => avx512::encode::<false>(src, dst, last, codec, column),
-                false => avx512::encode::<true>(src, dst, last, codec, column),
+            match (binary, codec.eol.soft_break().1 == 3) {
+                (true, true) => avx512::encode::<false, true>(src, dst, last, column),
+                (true, false) => avx512::encode::<false, false>(src, dst, last, column),
+                (false, true) => avx512::encode::<true, true>(src, dst, last, column),
+                (false, false) => avx512::encode::<true, false>(src, dst, last, column),
             }
         },
         (_, true) => walk::<false>(src, dst, last, codec, column),
