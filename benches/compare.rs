@@ -6,19 +6,21 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use quoted_printable_codec::codec::{QuotedPrintableCodec, QuotedPrintableEol};
+use quoted_printable_codec::{
+    codec::{QuotedPrintableCodec, QuotedPrintableEol},
+    cpu::QuotedPrintableCpu,
+};
 
 const SIZES: [usize; 4] = [64, 4 * 1024, 1024 * 1024, 10 * 1024 * 1024];
 
-const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
-    eol: QuotedPrintableEol::Crlf,
-    binary: false,
-};
-
-const BINARY: QuotedPrintableCodec = QuotedPrintableCodec {
-    binary: true,
-    ..TEXT
-};
+/// The codec of a body, with the best backend the CPU has.
+fn codec(binary: bool) -> QuotedPrintableCodec {
+    QuotedPrintableCodec {
+        cpu: QuotedPrintableCpu::detect(),
+        eol: QuotedPrintableEol::Crlf,
+        binary,
+    }
+}
 
 /// A xorshift stream, the same every run.
 fn random() -> impl Iterator<Item = u64> {
@@ -76,9 +78,9 @@ fn inputs(len: usize) -> [(&'static str, Vec<u8>, QuotedPrintableCodec); 3] {
     let binary = random().take(len).map(|word| word as u8).collect();
 
     [
-        ("ascii", prose(len, &ASCII), TEXT),
-        ("accented", prose(len, &ACCENTED), TEXT),
-        ("binary", binary, BINARY),
+        ("ascii", prose(len, &ASCII), codec(false)),
+        ("accented", prose(len, &ACCENTED), codec(false)),
+        ("binary", binary, codec(true)),
     ]
 }
 

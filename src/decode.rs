@@ -17,7 +17,14 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, pad, window};
+#[cfg(target_arch = "x86_64")]
+use crate::avx512;
+use crate::{
+    codec::QuotedPrintableCodec,
+    cpu::{QuotedPrintableBackend, QuotedPrintableCpu},
+    edge::Edge,
+    is_blank, is_plain, mask, pad, window,
+};
 
 /// The most trailing spaces and tabs a line break deletes: past them, the
 /// oldest are kept as data, as no well-formed line holds that many.
@@ -52,15 +59,19 @@ const CARRY: usize = BLANKS_MAX + 4;
 /// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
 #[derive(Clone, Debug, Default)]
 pub struct QuotedPrintableDecode {
+    cpu: QuotedPrintableCpu,
     edge: Edge<CARRY, CARRY>,
     dirty: bool,
 }
 
 impl QuotedPrintableDecode {
-    /// Builds a decoder, whatever the mode and the line ending of the codec:
-    /// decoding takes any.
-    pub fn new(_: QuotedPrintableCodec) -> Self {
-        Self::default()
+    /// Builds a decoder running the backend of `codec`, whatever its mode
+    /// and line ending: decoding takes any.
+    pub fn new(codec: QuotedPrintableCodec) -> Self {
+        Self {
+            cpu: codec.cpu,
+            ..Self::default()
+        }
     }
 
     /// Decodes as much of `src` as fits in `dst`.
@@ -69,9 +80,9 @@ impl QuotedPrintableDecode {
     /// next chunk; one byte of room always lets the decoder progress. The
     /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableDecodeOutput {
-        let dirty = &mut self.dirty;
+        let (cpu, dirty) = (self.cpu, &mut self.dirty);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
-            tokens(&src[..src.len().min(dst.len())], dst, last, dirty)
+            tokens(cpu, &src[..src.len().min(dst.len())], dst, last, dirty)
         });
 
         QuotedPrintableDecodeOutput {
@@ -88,9 +99,9 @@ impl QuotedPrintableDecode {
     /// decoder starts over for another input.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         let mut dirty = self.dirty;
-        let written = self
-            .edge
-            .finish(dst, |src, dst| tokens(src, dst, true, &mut dirty)[1])?;
+        let written = self.edge.finish(dst, |src, dst| {
+            tokens(self.cpu, src, dst, true, &mut dirty)[1]
+        })?;
         self.dirty = false;
 
         Some(QuotedPrintableDecodeOutput {
@@ -126,7 +137,7 @@ impl QuotedPrintableCodec {
         }
 
         let mut dirty = false;
-        let [read, written, _] = tokens(src, dst, true, &mut dirty);
+        let [read, written, _] = tokens(self.cpu, src, dst, true, &mut dirty);
 
         Some(QuotedPrintableDecodeOutput {
             read,
@@ -155,23 +166,42 @@ impl QuotedPrintableCodec {
     }
 }
 
-/// Decodes the tokens of `src` into `dst`, at least as long, returning the
-/// bytes read, written and held.
+/// Decodes the tokens of `src` into `dst`, at least as long, with the
+/// blocks of the backend `cpu` names, returning the bytes read, written and
+/// held.
 ///
 /// Unless `last` tells that the input ends with `src`, an escape, a soft
 /// break or a CR cut short is left unread, and the spaces and tabs a line
 /// break would delete are held: written past the ones counted, for the
 /// caller to carry.
-fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3] {
+fn tokens(
+    cpu: QuotedPrintableCpu,
+    src: &[u8],
+    dst: &mut [u8],
+    last: bool,
+    dirty: &mut bool,
+) -> [usize; 3] {
     let mut read = 0;
     let mut written = 0;
     let mut blanks = 0;
     // NOTE: padded first, so that its stores are done when blocks load them.
     let mut end = [0; 128];
-    pad(&mut end, src);
+
+    if cpu.backend() == QuotedPrintableBackend::Portable {
+        pad(&mut end, src);
+    }
 
     loop {
-        let [r, w] = blocks(&src[read..], &end, &mut dst[written..], &mut blanks, dirty);
+        let (rest, out, prev) = (&src[read..], &mut dst[written..], blanks > 0);
+        let [r, w] = match cpu.backend() {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: the token names a backend the CPU supports.
+            QuotedPrintableBackend::Avx512 => unsafe { avx512::decode(rest, out, prev, dirty) },
+            QuotedPrintableBackend::Portable => blocks(rest, &end, out, prev, dirty),
+        };
+        let ran = src[read..read + r].iter().rev().take(BLANKS_MAX + 1);
+        let trailing = ran.take_while(|&&b| is_blank(b)).count();
+        blanks = if trailing == r { blanks + r } else { trailing };
         read += r;
         written += w;
 
@@ -233,21 +263,15 @@ fn tokens(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3
 /// Decodes `src` into `dst`, at least as long, in blocks of 32 bytes, up to
 /// the first byte a block leaves to the token steps or the end of `src`,
 /// returning the bytes read and written; `end` holds the end of the input as
-/// [`pad`] copies it, `blanks` counts the spaces and tabs the next line break
-/// would delete, and `dirty` turns true on a byte that is not clean.
+/// [`pad`] copies it, `prev` tells whether a space or tab comes before `src`,
+/// and `dirty` turns true on a byte that is not clean.
 ///
 /// A block reads the 2 bytes after it ahead, and runs past its end to the end
 /// of an escape or a soft break that starts in it. It decodes literal bytes,
 /// escapes, soft breaks, and CRLF or LF with no blank before them: a
 /// malformed escape, a bare CR or a line break after a blank ends it.
 #[inline(never)]
-fn blocks(
-    src: &[u8],
-    end: &[u8; 128],
-    dst: &mut [u8],
-    blanks: &mut usize,
-    dirty: &mut bool,
-) -> [usize; 2] {
+fn blocks(src: &[u8], end: &[u8; 128], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
     let mut read = 0;
     let mut written = 0;
     let mut flags = 0;
@@ -286,7 +310,9 @@ fn blocks(
                 }
             } else if at < r {
             } else if matches!(w[at], b'\r' | b'\n') {
-                let blank = at.checked_sub(1).map_or(*blanks > 0, |at| is_blank(w[at]));
+                let blank = (read + at)
+                    .checked_sub(1)
+                    .map_or(prev, |i| is_blank(src[i]));
 
                 if blank || w[at] == b'\r' && w[at + 1] != b'\n' {
                     stop = at;
@@ -308,12 +334,6 @@ fn blocks(
             dst[written..written + n].copy_from_slice(&spare[..n]);
         }
 
-        let trailing = w[..r]
-            .iter()
-            .rev()
-            .take_while(|&&byte| is_blank(byte))
-            .count();
-        *blanks = if trailing == r { *blanks + r } else { trailing };
         read += r;
         written += n;
 
@@ -356,18 +376,33 @@ static DIGITS: [[u16; 256]; 2] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use crate::{codec::QuotedPrintableEol, decode::*};
+    use crate::{
+        codec::QuotedPrintableEol,
+        cpu::{QuotedPrintableCpu, available},
+        decode::*,
+    };
 
     const CODEC: QuotedPrintableCodec = QuotedPrintableCodec {
+        cpu: QuotedPrintableCpu::BASELINE,
         eol: QuotedPrintableEol::Crlf,
         binary: false,
     };
 
+    /// The decoding of `input` under every backend, checked the same.
     fn decoded(input: &[u8]) -> (Vec<u8>, bool) {
-        let mut out = vec![0; CODEC.decoded_len_max(input.len())];
-        let output = CODEC.decode(input, &mut out).unwrap();
-        out.truncate(output.written);
-        (out, output.clean)
+        let outs: Vec<_> = available()
+            .into_iter()
+            .map(|cpu| {
+                let codec = QuotedPrintableCodec { cpu, ..CODEC };
+                let mut out = vec![0; codec.decoded_len_max(input.len())];
+                let output = codec.decode(input, &mut out).unwrap();
+                out.truncate(output.written);
+                (out, output.clean)
+            })
+            .collect();
+
+        assert!(outs.windows(2).all(|pair| pair[0] == pair[1]));
+        outs[0].clone()
     }
 
     fn clean(bytes: &[u8]) -> (Vec<u8>, bool) {
@@ -459,20 +494,22 @@ mod tests {
         let mut input = vec![b'\t'; BLANKS_MAX];
         input.extend_from_slice(b"x=41=\r\n");
 
-        let mut decoder = QuotedPrintableDecode::new(CODEC);
-        let mut src = &input[..];
-        let mut out = Vec::new();
-        let mut room = [0; 1];
+        for cpu in available() {
+            let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec { cpu, ..CODEC });
+            let mut src = &input[..];
+            let mut out = Vec::new();
+            let mut room = [0; 1];
 
-        while !src.is_empty() {
-            let output = decoder.resume(src, &mut room);
-            assert!(output.read > 0 || output.written > 0);
-            out.extend_from_slice(&room[..output.written]);
-            src = &src[output.read..];
+            while !src.is_empty() {
+                let output = decoder.resume(src, &mut room);
+                assert!(output.read > 0 || output.written > 0);
+                out.extend_from_slice(&room[..output.written]);
+                src = &src[output.read..];
+            }
+
+            assert_eq!(decoder.finish(&mut room).unwrap().written, 0);
+            assert_eq!(out, decoded(&input).0);
         }
-
-        assert_eq!(decoder.finish(&mut room).unwrap().written, 0);
-        assert_eq!(out, decoded(&input).0);
     }
 
     #[test]
@@ -481,11 +518,13 @@ mod tests {
         assert_eq!(CODEC.decode(b"abc", &mut out), None);
         assert_eq!(out, [0xaa; 2]);
 
-        let mut decoder = QuotedPrintableDecode::new(CODEC);
-        decoder.resume(b"=4", &mut []);
-        assert_eq!(decoder.finish(&mut out[..1]), None);
-        assert_eq!(decoder.finish(&mut out).map(|end| end.written), Some(2));
-        assert_eq!(&out, b"=4");
+        for cpu in available() {
+            let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec { cpu, ..CODEC });
+            decoder.resume(b"=4", &mut []);
+            assert_eq!(decoder.finish(&mut out[..1]), None);
+            assert_eq!(decoder.finish(&mut out).map(|end| end.written), Some(2));
+            assert_eq!(&out, b"=4");
+        }
     }
 
     #[test]

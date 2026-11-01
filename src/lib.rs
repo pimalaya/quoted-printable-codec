@@ -1,32 +1,36 @@
 //! # quoted-printable-codec
 //!
 //! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7),
-//! lenient as mail needs it, `no_std`, with no dependency, no I/O and no
-//! unsafe code.
+//! lenient as mail needs it, with SIMD, `no_std`, no dependency and no I/O.
 //!
 //! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
-//! the mode, text or binary, and the line ending of encoded output. Its
-//! one-shot methods take a whole input at once. [`QuotedPrintableEncode`] and
-//! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
-//! then the caller's input and output buffers chunk by chunk, as any I/O-free
-//! coroutine does.
+//! a [`QuotedPrintableCpu`] backend token, which the application gets once,
+//! usually from `QuotedPrintableCpu::detect`, the mode, text or binary, and
+//! the line ending of encoded output. Its one-shot methods take a whole
+//! input at once. [`QuotedPrintableEncode`] and [`QuotedPrintableDecode`],
+//! from [`encode`] and [`decode`], take a codec, then the caller's input and
+//! output buffers chunk by chunk, as any I/O-free coroutine does.
 //!
-//! Both directions read their input in blocks of 32 bytes. A block takes a
-//! bitmask of its special bytes, built 16 lanes at a time in a shape
-//! compilers turn into vector compares on any target, and walks its set bits
-//! only: escapes, soft and hard line breaks, each literal run between them
-//! copied whole. The decoder leaves to token steps, byte by byte, what a
-//! block does not decide alone: malformed escapes, bare CRs, blanks before a
-//! line break and the end of the input. A block reads the last bytes of an
-//! input from a padded copy of them. The coroutines run the blocks straight
-//! between the caller's buffers, and keep only the few bytes they cannot
-//! decide yet, or have no room for, between two calls.
+//! The portable backend reads blocks of 32 bytes in safe code the compiler
+//! vectorizes on any target: a block takes a bitmask of its special bytes
+//! and walks its set bits only, each literal run between them copied whole.
+//! The AVX-512 backend reads blocks of 64 bytes with no branch on the data:
+//! decoding reads every escape of a block at once and compresses the rest
+//! away, encoding spreads each byte over the three lanes of its escape and
+//! compresses the unused ones away. Both leave to token steps what a block
+//! does not decide alone, such as a malformed escape or blanks before a line
+//! break, and the coroutines keep only the few bytes they cannot decide yet,
+//! or have no room for, between two calls.
 //!
 //! ```
-//! use quoted_printable_codec::codec::{QuotedPrintableCodec, QuotedPrintableEol};
+//! use quoted_printable_codec::{
+//!     codec::{QuotedPrintableCodec, QuotedPrintableEol},
+//!     cpu::QuotedPrintableCpu,
+//! };
 //!
 //! let input = "Grüße,\nJürgen\n".as_bytes();
 //! let codec = QuotedPrintableCodec {
+//!     cpu: QuotedPrintableCpu::BASELINE,
 //!     eol: QuotedPrintableEol::Crlf,
 //!     binary: false,
 //! };
@@ -43,17 +47,23 @@
 //! ```
 //!
 //! [`QuotedPrintableCodec`]: codec::QuotedPrintableCodec
+//! [`QuotedPrintableCpu`]: cpu::QuotedPrintableCpu
 //! [`QuotedPrintableEncode`]: encode::QuotedPrintableEncode
 //! [`QuotedPrintableDecode`]: decode::QuotedPrintableDecode
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
+#[cfg(any(feature = "std", test))]
+extern crate std;
 
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 pub mod codec;
+pub mod cpu;
 pub mod decode;
 mod edge;
 pub mod encode;
@@ -106,6 +116,7 @@ mod tests {
 
     use crate::{
         codec::{QuotedPrintableCodec, QuotedPrintableEol},
+        cpu::{QuotedPrintableCpu, available},
         decode::*,
         encode::*,
     };
@@ -135,11 +146,15 @@ mod tests {
             .collect()
     }
 
-    fn codecs() -> [QuotedPrintableCodec; 4] {
+    /// Every mode and line ending under `cpu`.
+    fn codecs(cpu: QuotedPrintableCpu) -> [QuotedPrintableCodec; 4] {
         [false, true]
             .map(|binary| {
-                [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf]
-                    .map(|eol| QuotedPrintableCodec { eol, binary })
+                [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf].map(|eol| QuotedPrintableCodec {
+                    cpu,
+                    eol,
+                    binary,
+                })
             })
             .concat()
             .try_into()
@@ -153,8 +168,11 @@ mod tests {
         out
     }
 
-    fn decoded(src: &[u8]) -> (Vec<u8>, bool) {
-        let codec = QuotedPrintableCodec::default();
+    fn decoded(src: &[u8], cpu: QuotedPrintableCpu) -> (Vec<u8>, bool) {
+        let codec = QuotedPrintableCodec {
+            cpu,
+            ..<_>::default()
+        };
         let mut out = vec![0; codec.decoded_len_max(src.len())];
         let output = codec.decode(src, &mut out).unwrap();
         out.truncate(output.written);
@@ -166,99 +184,114 @@ mod tests {
         let mut random = Random(0x1234_5678_9abc_def1);
 
         for body in bodies(&mut random) {
-            for codec in codecs() {
-                let mut encoder = QuotedPrintableEncode::new(codec);
-                let mut out = Vec::new();
+            for cpu in available() {
+                for codec in codecs(cpu) {
+                    let mut encoder = QuotedPrintableEncode::new(codec);
+                    let mut out = Vec::new();
 
-                for chunk in body.chunks(1 + random.below(40)) {
-                    let mut chunk = chunk;
+                    for chunk in body.chunks(1 + random.below(40)) {
+                        let mut chunk = chunk;
 
-                    while !chunk.is_empty() {
-                        let mut room = vec![0; 1 + random.below(200)];
-                        let output = encoder.resume(chunk, &mut room);
-                        out.extend_from_slice(&room[..output.written]);
-                        chunk = &chunk[output.read..];
+                        while !chunk.is_empty() {
+                            let mut room = vec![0; 1 + random.below(200)];
+                            let output = encoder.resume(chunk, &mut room);
+                            out.extend_from_slice(&room[..output.written]);
+                            chunk = &chunk[output.read..];
+                        }
                     }
+
+                    let mut room = vec![0; 300];
+                    let end = encoder.finish(&mut room).unwrap();
+                    out.extend_from_slice(&room[..end]);
+                    assert_eq!(out, encoded(&body, codec));
+                    let portable = QuotedPrintableCodec {
+                        cpu: available()[0],
+                        ..codec
+                    };
+                    assert_eq!(out, encoded(&body, portable));
                 }
 
-                let mut room = vec![0; 300];
-                let end = encoder.finish(&mut room).unwrap();
-                out.extend_from_slice(&room[..end]);
-                assert_eq!(out, encoded(&body, codec));
-            }
+                for src in [body.clone(), encoded(&body, <_>::default())] {
+                    let codec = QuotedPrintableCodec {
+                        cpu,
+                        ..<_>::default()
+                    };
+                    let mut decoder = QuotedPrintableDecode::new(codec);
+                    let mut out = Vec::new();
 
-            for src in [
-                body.clone(),
-                encoded(&body, QuotedPrintableCodec::default()),
-            ] {
-                let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec::default());
-                let mut out = Vec::new();
+                    for chunk in src.chunks(1 + random.below(40)) {
+                        let mut chunk = chunk;
 
-                for chunk in src.chunks(1 + random.below(40)) {
-                    let mut chunk = chunk;
-
-                    while !chunk.is_empty() {
-                        let mut room = vec![0; 1 + random.below(100)];
-                        let output = decoder.resume(chunk, &mut room);
-                        out.extend_from_slice(&room[..output.written]);
-                        chunk = &chunk[output.read..];
+                        while !chunk.is_empty() {
+                            let mut room = vec![0; 1 + random.below(100)];
+                            let output = decoder.resume(chunk, &mut room);
+                            out.extend_from_slice(&room[..output.written]);
+                            chunk = &chunk[output.read..];
+                        }
                     }
-                }
 
-                let mut room = vec![0; 300];
-                let end = decoder.finish(&mut room).unwrap();
-                out.extend_from_slice(&room[..end.written]);
-                assert_eq!((out, end.clean), decoded(&src));
+                    let mut room = vec![0; 300];
+                    let end = decoder.finish(&mut room).unwrap();
+                    out.extend_from_slice(&room[..end.written]);
+                    let output = (out, end.clean);
+                    assert_eq!(output, decoded(&src, cpu));
+                    assert_eq!(output, decoded(&src, available()[0]));
+                }
             }
         }
     }
 
     #[test]
     fn a_frozen_corpus_keeps_its_output() {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        let mut fold = |bytes: &[u8]| {
-            for &byte in bytes {
-                hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
-            }
-        };
+        for cpu in available() {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            let mut fold = |bytes: &[u8]| {
+                for &byte in bytes {
+                    hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+                }
+            };
 
-        for body in bodies(&mut Random(0x0f1e_2d3c_4b5a_6978)) {
-            for codec in codecs() {
-                let out = encoded(&body, codec);
-                let (back, clean) = decoded(&out);
+            for body in bodies(&mut Random(0x0f1e_2d3c_4b5a_6978)) {
+                for codec in codecs(cpu) {
+                    let out = encoded(&body, codec);
+                    let (back, clean) = decoded(&out, cpu);
+                    fold(&out);
+                    fold(&back);
+                    fold(&[clean as u8]);
+                }
+
+                let (out, clean) = decoded(&body, cpu);
                 fold(&out);
-                fold(&back);
                 fold(&[clean as u8]);
             }
 
-            let (out, clean) = decoded(&body);
-            fold(&out);
-            fold(&[clean as u8]);
+            assert_eq!(hash, 5_623_604_759_311_401_023);
         }
-
-        assert_eq!(hash, 5_623_604_759_311_401_023);
     }
 
     #[test]
     fn a_finished_coroutine_starts_over() {
-        let codec = QuotedPrintableCodec::default();
-        let mut encoder = QuotedPrintableEncode::new(codec);
-        let mut decoder = QuotedPrintableDecode::new(codec);
-        let mut out = [0; 512];
+        for cpu in available() {
+            let codec = QuotedPrintableCodec {
+                cpu,
+                ..<_>::default()
+            };
+            let mut encoder = QuotedPrintableEncode::new(codec);
+            let mut decoder = QuotedPrintableDecode::new(codec);
+            let mut out = [0; 512];
 
-        for src in [&b"a=zb"[..], &[b'x'; 50], &[b'x'; 50]] {
-            let written = encoder.resume(src, &mut out).written;
-            let end = encoder.finish(&mut out[written..]).unwrap();
-            assert_eq!(out[..written + end], encoded(src, codec));
-        }
+            for src in [&b"a=zb"[..], &[b'x'; 50], &[b'x'; 50]] {
+                let written = encoder.resume(src, &mut out).written;
+                let end = encoder.finish(&mut out[written..]).unwrap();
+                assert_eq!(out[..written + end], encoded(src, codec));
+            }
 
-        for src in [&b"a=zb"[..], b"a=3Db"] {
-            let written = decoder.resume(src, &mut out).written;
-            let end = decoder.finish(&mut out[written..]).unwrap();
-            assert_eq!(
-                (out[..written + end.written].to_vec(), end.clean),
-                decoded(src)
-            );
+            for src in [&b"a=zb"[..], b"a=3Db"] {
+                let written = decoder.resume(src, &mut out).written;
+                let end = decoder.finish(&mut out[written..]).unwrap();
+                let output = (out[..written + end.written].to_vec(), end.clean);
+                assert_eq!(output, decoded(src, cpu));
+            }
         }
     }
 }

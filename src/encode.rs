@@ -17,14 +17,18 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
+use crate::avx512;
 use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, pad, window};
 
 /// The most characters a line holds before its soft break `=`.
-const LINE: usize = 75;
+pub(crate) const LINE: usize = 75;
 
-/// The output bytes a block may touch: it commits at most 32 escapes and two
-/// soft breaks, under 128 bytes, and copies a run whole past them.
-const ROOM: usize = 128 + 32;
+/// The output bytes a block may touch: a portable block commits at most 32
+/// escapes and two soft breaks, under 128 bytes, and copies a run whole past
+/// them; an AVX-512 chunk writes three groups of at most 66 bytes, and up to
+/// 68 bytes past the start of each.
+pub(crate) const ROOM: usize = 200;
 
 /// I/O-free quoted-printable encoder, resumed with the caller's input and
 /// output buffers.
@@ -57,7 +61,8 @@ pub struct QuotedPrintableEncode {
 }
 
 impl QuotedPrintableEncode {
-    /// Builds an encoder running the mode and the line ending of `codec`.
+    /// Builds an encoder running the backend, the mode and the line ending of
+    /// `codec`.
     pub fn new(codec: QuotedPrintableCodec) -> Self {
         Self {
             codec,
@@ -141,13 +146,12 @@ impl QuotedPrintableCodec {
     }
 }
 
-/// Encodes `src` into `dst` from `column` in blocks of 32 bytes, as many as
-/// fit, returning the bytes read and written, and none held, as [`Edge`]
-/// asks.
+/// Encodes `src` into `dst` from `column`, as much as fits, with the blocks of
+/// the codec's backend, returning the bytes read and written, and none held,
+/// as [`Edge`] asks.
 ///
-/// Each block reads the 2 bytes after it ahead. Unless `last` tells that the
-/// input ends with `src`, a space, tab or CR that may end a line is left
-/// unread when `src` ends before telling.
+/// Unless `last` tells that the input ends with `src`, a space, tab or CR
+/// that may end a line is left unread when `src` ends before telling.
 fn blocks(
     src: &[u8],
     dst: &mut [u8],
@@ -155,14 +159,24 @@ fn blocks(
     codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    match codec.binary {
-        true => walk::<false>(src, dst, last, codec, column),
-        false => walk::<true>(src, dst, last, codec, column),
+    match (codec.cpu.wide(src), codec.binary) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the codec's token names the AVX-512 backend, which the CPU
+        // supports.
+        (true, binary) => unsafe {
+            match binary {
+                true => avx512::encode::<false>(src, dst, last, codec, column),
+                false => avx512::encode::<true>(src, dst, last, codec, column),
+            }
+        },
+        (_, true) => walk::<false>(src, dst, last, codec, column),
+        (_, false) => walk::<true>(src, dst, last, codec, column),
     }
 }
 
-/// The loop of [`blocks`], built apart for each mode, `TEXT` reading line
-/// breaks: a mode tested for each byte costs a fifth of binary encoding.
+/// The portable loop of [`blocks`], in blocks of 32 bytes reading the 2 bytes
+/// after them ahead, built apart for each mode, `TEXT` reading line breaks: a
+/// mode tested for each byte costs a fifth of binary encoding.
 fn walk<const TEXT: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -281,9 +295,14 @@ static ESCAPES: [[u8; 4]; 256] = {
 mod tests {
     use alloc::{vec, vec::Vec};
 
-    use crate::{codec::QuotedPrintableEol, encode::*};
+    use crate::{
+        codec::QuotedPrintableEol,
+        cpu::{QuotedPrintableCpu, available},
+        encode::*,
+    };
 
     const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
+        cpu: QuotedPrintableCpu::BASELINE,
         eol: QuotedPrintableEol::Crlf,
         binary: false,
     };
@@ -293,11 +312,21 @@ mod tests {
         ..TEXT
     };
 
+    /// The encoding of `input` under every backend, checked the same.
     fn encoded(input: &[u8], codec: QuotedPrintableCodec) -> Vec<u8> {
-        let mut out = vec![0; codec.encoded_len_max(input.len()).unwrap()];
-        let written = codec.encode(input, &mut out).unwrap();
-        out.truncate(written);
-        out
+        let outs: Vec<_> = available()
+            .into_iter()
+            .map(|cpu| {
+                let codec = QuotedPrintableCodec { cpu, ..codec };
+                let mut out = vec![0; codec.encoded_len_max(input.len()).unwrap()];
+                let written = codec.encode(input, &mut out).unwrap();
+                out.truncate(written);
+                out
+            })
+            .collect();
+
+        assert!(outs.windows(2).all(|pair| pair[0] == pair[1]));
+        outs[0].clone()
     }
 
     fn text(input: &[u8]) -> Vec<u8> {
@@ -368,7 +397,10 @@ mod tests {
     fn one_byte_of_room_always_progresses() {
         let input: Vec<u8> = (0..=255).chain(b"a \r\nb \rc\t".iter().copied()).collect();
 
-        for codec in [TEXT, BINARY] {
+        for codec in available()
+            .iter()
+            .flat_map(|&cpu| [TEXT, BINARY].map(|c| QuotedPrintableCodec { cpu, ..c }))
+        {
             let mut encoder = QuotedPrintableEncode::new(codec);
             let mut src = &input[..];
             let mut out = Vec::new();
@@ -394,11 +426,13 @@ mod tests {
         assert_eq!(TEXT.encode(b"f", &mut out), None);
         assert_eq!(out, [0xaa; 3]);
 
-        let mut encoder = QuotedPrintableEncode::new(TEXT);
-        assert_eq!(encoder.resume(b" ", &mut []).read, 1);
-        assert_eq!(encoder.finish(&mut out[..2]), None);
-        assert_eq!(encoder.finish(&mut out), Some(3));
-        assert_eq!(&out, b"=20");
+        for cpu in available() {
+            let mut encoder = QuotedPrintableEncode::new(QuotedPrintableCodec { cpu, ..TEXT });
+            assert_eq!(encoder.resume(b" ", &mut []).read, 1);
+            assert_eq!(encoder.finish(&mut out[..2]), None);
+            assert_eq!(encoder.finish(&mut out), Some(3));
+            assert_eq!(&out, b"=20");
+        }
     }
 
     #[test]

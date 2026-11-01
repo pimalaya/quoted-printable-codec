@@ -19,12 +19,13 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 alloc = []
+std = ["alloc"]
 
 [[bench]]
 name = "compare"
 path = "benches/compare.rs"
 harness = false
-required-features = ["alloc"]
+required-features = ["std"]
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

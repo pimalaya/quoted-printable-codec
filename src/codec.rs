@@ -1,18 +1,22 @@
 //! # Codec
 //!
-//! [`QuotedPrintableCodec`], the configuration every call runs: the mode and
-//! the line ending of encoded output. Its one-shot methods, in
+//! [`QuotedPrintableCodec`], the configuration every call runs: the backend,
+//! the mode and the line ending of encoded output. Its one-shot methods, in
 //! [`encode`](crate::encode) and [`decode`](crate::decode), encode and decode
 //! a whole input; the coroutines of those modules take it to work chunk by
 //! chunk.
 
-/// The mode and the line ending of encoded output.
+use crate::cpu::QuotedPrintableCpu;
+
+/// The backend, the mode and the line ending of encoded output.
 ///
 /// A plain value holding no state: an application builds one and uses it
 /// for every call, its one-shot methods as the encoders and decoders built
-/// from it. Defaults to text with CRLF.
+/// from it. Defaults to the build's baseline backend, text with CRLF.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct QuotedPrintableCodec {
+    /// The backend every call runs.
+    pub cpu: QuotedPrintableCpu,
     /// The line ending of hard and soft line breaks. Decoding takes either.
     pub eol: QuotedPrintableEol,
     /// Whether CR and LF are escaped as data rather than read as line
