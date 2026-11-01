@@ -1,7 +1,7 @@
 ---
 cairn: change
 id: the-speed-plan
-status: draft
+status: landed
 created: 2026-11-01
 ---
 

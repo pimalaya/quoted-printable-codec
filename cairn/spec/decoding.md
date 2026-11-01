@@ -16,6 +16,11 @@ The decoder SHALL turn `=XX` into its byte, either case of hex digits accepted a
 
 The decoder SHALL keep CRLF and bare LF as they are, drop a bare CR and report it, and delete the spaces and tabs that end a line or the input. It SHALL carry at most 76 such blanks: past them, the oldest are kept as data.
 
+#### Scenario: Too many blanks
+- GIVEN 78 spaces then CRLF
+- WHEN they are decoded
+- THEN the output is 2 spaces then CRLF, reported clean
+
 ### Requirement: Malformed input
 
 A `=` that starts neither an escape nor a soft break SHALL be kept with the hex digit after it, if any, and reported; the bytes after are decoded again as data. A byte outside `!` to `~`, space, tab, CR and LF SHALL be kept and reported.

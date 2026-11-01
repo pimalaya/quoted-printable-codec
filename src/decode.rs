@@ -9,28 +9,29 @@
 //! anything else is kept. Decoding never fails: it returns the bytes, and
 //! whether the input was clean.
 //!
-//! [`QuotedPrintableDecode`] takes the input chunk by chunk; [`decode`] and `decode_vec`
-//! run it once over a whole input. Encoding is the sibling module
-//! [`encode`](crate::encode).
+//! [`QuotedPrintableDecode`] takes the input chunk by chunk; [`decode`] and
+//! `decode_vec` run its core once over a whole input. Encoding is the
+//! sibling module [`encode`](crate::encode).
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::queue::Queue;
+use crate::{edge::Edge, is_blank, is_plain, mask, window};
 
-/// The most trailing spaces and tabs the decoder carries: past them, the
+/// The most trailing spaces and tabs a line break deletes: past them, the
 /// oldest are kept as data, as no well-formed line holds that many.
 const BLANKS_MAX: usize = 76;
 
-/// The longest output of one input byte: the carried blanks, a kept `=` and
-/// its hex digit, and the byte itself.
-const STEP_MAX: usize = BLANKS_MAX + 3;
+/// The longest token the decoder cannot decide yet, `=`, the most blanks
+/// and a CR, and room for one more byte.
+const CARRY: usize = BLANKS_MAX + 4;
 
 /// I/O-free quoted-printable decoder, resumed with the caller's input and
 /// output buffers.
 ///
 /// The input can be cut anywhere, mid-escape included: the decoder carries
-/// an unfinished escape, a CR and the spaces and tabs that may end a line.
+/// an unfinished escape or soft break, a CR, and the spaces and tabs that
+/// may end a line.
 ///
 /// ```
 /// use quoted_printable_codec::decode::QuotedPrintableDecode;
@@ -50,28 +51,8 @@ const STEP_MAX: usize = BLANKS_MAX + 3;
 /// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
 #[derive(Clone, Debug)]
 pub struct QuotedPrintableDecode {
-    state: State,
-    blanks: [u8; BLANKS_MAX],
-    blanks_len: usize,
+    edge: Edge<CARRY, CARRY>,
     clean: bool,
-    queue: Queue<STEP_MAX>,
-}
-
-/// Where the decoder stands in the input.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum State {
-    /// In data, the carried blanks possibly ending the line.
-    Text,
-    /// After a CR in data.
-    Cr,
-    /// After `=`.
-    Equals,
-    /// After `=` and a hex digit.
-    Hex(u8),
-    /// After `=` and spaces or tabs, carried as blanks.
-    EqualsBlanks,
-    /// After `=`, spaces or tabs and a CR.
-    EqualsCr,
 }
 
 impl Default for QuotedPrintableDecode {
@@ -84,35 +65,26 @@ impl QuotedPrintableDecode {
     /// Builds a decoder.
     pub fn new() -> Self {
         Self {
-            state: State::Text,
-            blanks: [0; BLANKS_MAX],
-            blanks_len: 0,
+            edge: Edge::new(),
             clean: true,
-            queue: Queue::new(),
         }
     }
 
     /// Decodes as much of `src` as fits in `dst`.
     ///
     /// The caller drains `dst` and resumes with the rest of `src` or the
-    /// next chunk; one byte of room always lets the decoder progress.
+    /// next chunk; one byte of room always lets the decoder progress. The
+    /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableDecodeOutput {
-        let mut read = 0;
-        let mut written = 0;
+        let clean = &mut self.clean;
+        let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
+            tokens(&src[..src.len().min(dst.len())], dst, last, clean)
+        });
 
-        loop {
-            written += self.queue.drain(&mut dst[written..]);
-
-            if !self.queue.is_empty() || read == src.len() {
-                return QuotedPrintableDecodeOutput {
-                    read,
-                    written,
-                    clean: self.clean,
-                };
-            }
-
-            self.step(src[read]);
-            read += 1;
+        QuotedPrintableDecodeOutput {
+            read,
+            written,
+            clean: self.clean,
         }
     }
 
@@ -121,150 +93,17 @@ impl QuotedPrintableDecode {
     ///
     /// Returns none, writing nothing, when `dst` is too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
-        match self.state {
-            State::Text | State::Equals | State::EqualsBlanks => (),
-            State::Cr => self.clean = false,
-            State::Hex(high) => {
-                self.queue.push(&[b'=', high]);
-                self.clean = false;
-            }
-            State::EqualsCr => {
-                self.queue.push(b"=");
-                self.clean = false;
-            }
-        }
-
-        self.state = State::Text;
-        self.blanks_len = 0;
-
-        if dst.len() < self.queue.len() {
-            return None;
-        }
+        let mut clean = self.clean;
+        let written = self
+            .edge
+            .finish(dst, |src, dst| tokens(src, dst, true, &mut clean)[1])?;
+        self.clean = clean;
 
         Some(QuotedPrintableDecodeOutput {
             read: 0,
-            written: self.queue.drain(dst),
-            clean: self.clean,
+            written,
+            clean,
         })
-    }
-
-    /// Decodes one byte into the queue, a byte that ends a malformed escape
-    /// being decoded again as data.
-    fn step(&mut self, byte: u8) {
-        loop {
-            match (self.state, byte) {
-                (State::Text, b' ' | b'\t') => {
-                    if self.blanks_len == BLANKS_MAX {
-                        self.flush_blanks();
-                    }
-
-                    self.push_blank(byte);
-                }
-                (State::Text, b'=') => {
-                    self.flush_blanks();
-                    self.state = State::Equals;
-                }
-                (State::Text, b'\r') => self.state = State::Cr,
-                (State::Text, b'\n') => {
-                    self.blanks_len = 0;
-                    self.queue.push(b"\n");
-                }
-                (State::Text, _) => {
-                    self.flush_blanks();
-                    self.clean &= matches!(byte, b'!'..=b'~');
-                    self.queue.push(&[byte]);
-                }
-                (State::Cr, b'\n') => {
-                    self.blanks_len = 0;
-                    self.queue.push(b"\r\n");
-                    self.state = State::Text;
-                }
-                (State::Cr, _) => {
-                    self.clean = false;
-                    self.state = State::Text;
-                    continue;
-                }
-                (State::Equals, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f') => {
-                    self.state = State::Hex(byte);
-                }
-                (State::Equals, b' ' | b'\t') => {
-                    self.push_blank(byte);
-                    self.state = State::EqualsBlanks;
-                }
-                (State::Equals, b'\r') => self.state = State::EqualsCr,
-                (State::Equals | State::EqualsBlanks, b'\n') => self.soft_break(),
-                (State::Equals, _) => {
-                    self.malformed(b"=", State::Text);
-                    continue;
-                }
-                (State::Hex(high), _) => match (hex(high), hex(byte)) {
-                    (Some(high_nibble), Some(low_nibble)) => {
-                        self.clean &= !high.is_ascii_lowercase() && !byte.is_ascii_lowercase();
-                        self.queue.push(&[high_nibble << 4 | low_nibble]);
-                        self.state = State::Text;
-                    }
-                    _ => {
-                        self.malformed(&[b'=', high], State::Text);
-                        continue;
-                    }
-                },
-                (State::EqualsBlanks, b' ' | b'\t') => {
-                    if self.blanks_len == BLANKS_MAX {
-                        self.malformed(b"=", State::Text);
-                        continue;
-                    }
-
-                    self.push_blank(byte);
-                }
-                (State::EqualsBlanks, b'\r') => self.state = State::EqualsCr,
-                (State::EqualsBlanks, _) => {
-                    self.malformed(b"=", State::Text);
-                    continue;
-                }
-                (State::EqualsCr, b'\n') => self.soft_break(),
-                (State::EqualsCr, _) => {
-                    self.malformed(b"=", State::Cr);
-                    continue;
-                }
-            }
-
-            return;
-        }
-    }
-
-    fn push_blank(&mut self, byte: u8) {
-        self.blanks[self.blanks_len] = byte;
-        self.blanks_len += 1;
-    }
-
-    /// Keeps the carried blanks as data, a byte other than a line break
-    /// following them.
-    fn flush_blanks(&mut self) {
-        self.queue.push(&self.blanks[..self.blanks_len]);
-        self.blanks_len = 0;
-    }
-
-    fn soft_break(&mut self) {
-        self.blanks_len = 0;
-        self.state = State::Text;
-    }
-
-    /// Keeps the bytes of a malformed escape literally and goes on from
-    /// `state`, the blanks after its `=` carried as data.
-    fn malformed(&mut self, bytes: &[u8], state: State) {
-        self.queue.push(bytes);
-        self.clean = false;
-        self.state = state;
-    }
-}
-
-/// The value of a hex digit, either case.
-const fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
     }
 }
 
@@ -282,17 +121,17 @@ pub struct QuotedPrintableDecodeOutput {
 /// Decodes the whole of `src` into `dst`.
 ///
 /// Returns none, writing nothing, when `dst` is shorter than
-/// [`decoded_len_max`] asks.
+/// [`decoded_len_max`] asks. Within that length, the bytes of `dst` past the
+/// ones written may be overwritten.
 pub fn decode(src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
     let dst = dst.get_mut(..decoded_len_max(src.len()))?;
-    let mut decoder = QuotedPrintableDecode::new();
-    let output = decoder.resume(src, dst);
-    let end = decoder.finish(&mut dst[output.written..])?;
+    let mut clean = true;
+    let [read, written, _] = tokens(src, dst, true, &mut clean);
 
     Some(QuotedPrintableDecodeOutput {
-        read: output.read,
-        written: output.written + end.written,
-        clean: end.clean,
+        read,
+        written,
+        clean,
     })
 }
 
@@ -304,14 +143,10 @@ pub fn decode_vec(src: &[u8], out: &mut Vec<u8>) -> bool {
     let start = out.len();
     out.resize(start + decoded_len_max(src.len()), 0);
 
-    let decoded = decode(src, &mut out[start..]).unwrap_or(QuotedPrintableDecodeOutput {
-        read: 0,
-        written: 0,
-        clean: false,
-    });
-
-    out.truncate(start + decoded.written);
-    decoded.clean
+    let mut clean = true;
+    let [_, written, _] = tokens(src, &mut out[start..], true, &mut clean);
+    out.truncate(start + written);
+    clean
 }
 
 /// The most bytes [`decode`] writes for an input of `len` bytes, whatever
@@ -319,6 +154,204 @@ pub fn decode_vec(src: &[u8], out: &mut Vec<u8>) -> bool {
 pub const fn decoded_len_max(len: usize) -> usize {
     len
 }
+
+/// Decodes the tokens of `src` into `dst`, at least as long, returning the
+/// bytes read, written and held.
+///
+/// Unless `last` tells that the input ends with `src`, an escape, a soft
+/// break or a CR cut short is left unread, and the spaces and tabs a line
+/// break would delete are held: written past the ones counted, for the
+/// caller to carry.
+fn tokens(src: &[u8], dst: &mut [u8], last: bool, clean: &mut bool) -> [usize; 3] {
+    let mut read = 0;
+    let mut written = 0;
+    let mut blanks = 0;
+    let mut irregular = 0;
+
+    loop {
+        if read >= irregular && read < src.len() {
+            match block(&src[read..], &mut dst[written..], blanks > 0, clean) {
+                Ok([r, w, trailing]) => {
+                    read += r;
+                    written += w;
+                    blanks = if trailing == r { blanks + r } else { trailing };
+                    continue;
+                }
+                Err(at) => irregular = read + at + 1,
+            }
+        }
+
+        match src[read..] {
+            [b'=', high, low, ..] if (HEX[high as usize] | HEX[low as usize]) < 0x80 => {
+                let (high, low) = (HEX[high as usize], HEX[low as usize]);
+                *clean &= (high | low) & 0x10 == 0;
+                dst[written] = high << 4 | low & 0xf;
+                read += 3;
+                written += 1;
+            }
+            [b'=', ref after @ ..] => {
+                let spaces = after
+                    .iter()
+                    .take(BLANKS_MAX + 1)
+                    .take_while(|&&byte| is_blank(byte))
+                    .count();
+
+                let digit = after.first().is_some_and(|&byte| HEX[byte as usize] < 0x80);
+                let eol = match after[spaces..] {
+                    _ if spaces > BLANKS_MAX => None,
+                    [b'\n', ..] => Some(1),
+                    [b'\r', b'\n', ..] => Some(2),
+                    [] if last => Some(0),
+                    [] | [b'\r'] if !last => return [read, written, 0],
+                    [_] if digit && !last => return [read, written, 0],
+                    _ => None,
+                };
+
+                if let Some(eol) = eol {
+                    read += 1 + spaces + eol;
+                } else {
+                    let kept = 1 + digit as usize;
+                    dst[written..written + kept].copy_from_slice(&src[read..read + kept]);
+                    *clean = false;
+                    read += kept;
+                    written += kept;
+                }
+            }
+            [b'\r', b'\n', ..] | [b'\n', ..] => {
+                let len = 1 + (src[read] == b'\r') as usize;
+                written -= blanks.min(BLANKS_MAX);
+                dst[written..written + len].copy_from_slice(&src[read..read + len]);
+                read += len;
+                written += len;
+            }
+            [b'\r', ref rest @ ..] if last || !rest.is_empty() => {
+                *clean = false;
+                read += 1;
+                continue;
+            }
+            [] | [b'\r'] => {
+                let held = blanks.min(BLANKS_MAX);
+                written -= held;
+                return [read, written, if last { 0 } else { held }];
+            }
+            [byte, ..] => {
+                dst[written] = byte;
+                *clean &= is_plain(byte);
+                blanks = if is_blank(byte) { blanks + 1 } else { 0 };
+                read += 1;
+                written += 1;
+                continue;
+            }
+        }
+
+        blanks = 0;
+    }
+}
+
+/// Decodes the first 32 bytes of `src`, or all of them when fewer, into
+/// `dst`, returning the bytes read, written, and the spaces and tabs that
+/// end them; `blank` tells that a space or tab the next line break would
+/// delete comes before them.
+///
+/// The 2 bytes after them are read ahead, and the bytes read run past them
+/// to the end of an escape or a soft break that starts in them. They hold
+/// only literal bytes, escapes, soft breaks and CRLF or LF with no blank
+/// before them, or the offset of the first other one is returned, and the
+/// token steps decode them instead.
+// NOTE: folded into `tokens`, its loop runs out of registers: 70% slower on
+// escapes.
+fn block(src: &[u8], dst: &mut [u8], blank: bool, clean: &mut bool) -> Result<[usize; 3], usize> {
+    let mut buffer = [0; 64];
+    let w = window(src, &mut buffer);
+    let len = src.len().min(32);
+    let lanes = ((1u64 << len) - 1) as u32;
+    let mut equals = mask(w, |byte| byte == b'=') & lanes;
+    let mut others = !mask(w, is_plain) & !equals & lanes;
+
+    let mut spare = [0; 64];
+    let direct = dst.len() >= 64;
+    let out = if direct {
+        &mut dst[..64]
+    } else {
+        &mut spare[..]
+    };
+    let mut read = 0;
+    let mut written = 0;
+    let mut dirty = 0;
+
+    while equals != 0 {
+        let at = equals.trailing_zeros() as usize;
+        let [high, low] = [w[at + 1], w[at + 2]];
+        let digits = HEX[high as usize] | HEX[low as usize];
+        let escape = digits < 0x80;
+
+        if !escape && high != b'\n' && [high, low] != *b"\r\n" {
+            return Err(at);
+        }
+
+        out[written & 31..][..32].copy_from_slice(&w[read & 31..][..32]);
+        written += at - read;
+        out[written & 63] = HEX[high as usize] << 4 | HEX[low as usize] & 0xf;
+        written += escape as usize;
+        dirty |= digits & (escape as u8) << 4;
+        read = at + 2 + (escape | (high == b'\r')) as usize;
+        equals &= equals - 1;
+    }
+
+    while others != 0 {
+        let at = others.trailing_zeros() as usize;
+        let before = if at > 0 {
+            w[at - 1]
+        } else {
+            blank as u8 * b' '
+        };
+        let soft = before == b'=' || at > 1 && w[at - 2..at] == *b"=\r";
+
+        match w[at] {
+            b'\r' | b'\n' if soft => (),
+            b'\r' if w[at + 1] != b'\n' => return Err(at),
+            b'\r' | b'\n' if is_blank(before) => return Err(at),
+            b'\r' | b'\n' => (),
+            _ => dirty |= 1,
+        }
+
+        others &= others - 1;
+    }
+
+    if read < len {
+        out[written & 31..][..32].copy_from_slice(&w[read..][..32]);
+        written += len - read;
+        read = len;
+    }
+
+    if !direct {
+        let len = dst.len();
+        dst.copy_from_slice(&spare[..len]);
+    }
+
+    *clean &= dirty == 0;
+    let trailing = w[..len]
+        .iter()
+        .rev()
+        .take_while(|&&byte| is_blank(byte))
+        .count();
+    Ok([read, written, trailing])
+}
+
+/// The value of each byte as a hex digit, 0x10 added to a lowercase one, or
+/// 0x80 for any other byte.
+static HEX: [u8; 256] = {
+    let mut table = [0x80; 256];
+    let mut digit = 0;
+
+    while digit < 16 {
+        table[b"0123456789ABCDEF"[digit] as usize] = digit as u8;
+        table[b"0123456789abcdef"[digit] as usize] = digit as u8 | (digit as u8 / 10) << 4;
+        digit += 1;
+    }
+
+    table
+};
 
 #[cfg(test)]
 mod tests {
@@ -388,7 +421,7 @@ mod tests {
     fn too_many_blanks_are_kept() {
         let mut input = vec![b' '; BLANKS_MAX + 2];
         input.extend_from_slice(b"\r\n");
-        let mut expected = vec![b' '; BLANKS_MAX];
+        let mut expected = vec![b' '; 2];
         expected.extend_from_slice(b"\r\n");
         assert_eq!(decoded(&input), clean(&expected));
     }
@@ -421,23 +454,6 @@ mod tests {
                         .all(|line| line.len() <= 77)
                 );
             }
-        }
-    }
-
-    #[test]
-    fn every_split_gives_the_same_output() {
-        let input = b"a =4\r\n=\t\r\nb=c3=A9 \r\nc= \rd=\r\n\te \t";
-        let whole = decoded(input);
-
-        for at in 0..=input.len() {
-            let mut decoder = QuotedPrintableDecode::new();
-            let mut out = vec![0; input.len()];
-            let first = decoder.resume(&input[..at], &mut out);
-            let second = decoder.resume(&input[at..], &mut out[first.written..]);
-            let written = first.written + second.written;
-            let end = decoder.finish(&mut out[written..]).unwrap();
-            out.truncate(written + end.written);
-            assert_eq!((out, end.clean), whole);
         }
     }
 

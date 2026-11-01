@@ -6,11 +6,11 @@ status: current
 
 # Calls
 
-How encoding and decoding are called: I/O-free, over the caller's buffers, chunk by chunk through `QuotedPrintableEncode` and `QuotedPrintableDecode` or at once through the one-shot functions built on them, with no dependency and no allocation outside the `alloc` helpers.
+How encoding and decoding are called: I/O-free, over the caller's buffers, chunk by chunk through `QuotedPrintableEncode` and `QuotedPrintableDecode` or at once through the one-shot functions, which run the same blocks, with no dependency and no allocation outside the `alloc` helpers.
 
 ### Requirement: Lengths and short buffers
 
-`encoded_len_max` SHALL bound what `encode` writes, or return none when that overflows `usize`; `decoded_len_max` SHALL bound what `decode` writes. `encode` and `decode` SHALL return none and write nothing when `dst` is shorter than their length helper asks.
+`encoded_len_max` SHALL bound what `encode` writes, or return none when that overflows `usize`; `decoded_len_max` SHALL bound what `decode` writes. `encode` and `decode` SHALL return none and write nothing when `dst` is shorter than their length helper asks. Every call MAY overwrite the bytes of `dst` past the ones it reports written, within the length it was given.
 
 ### Requirement: Resumable without I/O
 
@@ -18,4 +18,4 @@ How encoding and decoding are called: I/O-free, over the caller's buffers, chunk
 
 ### Requirement: No dependency, no std
 
-The library SHALL build `#![no_std]` with no dependency and no unsafe code, `alloc` serving only `encode_vec` and `decode_vec`.
+The library SHALL build `#![no_std]` with no dependency and no unsafe code, `alloc` serving only `encode_vec` and `decode_vec`, and no CPU feature beyond the target's baseline.

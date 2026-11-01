@@ -9,23 +9,27 @@
 //! CR in text mode and a space or tab that would end a line are escaped as
 //! `=XX`, uppercase; an escape is never split across lines.
 //!
-//! [`QuotedPrintableEncode`] takes the input chunk by chunk; [`encode`] and `encode_vec`
-//! run it once over a whole input. Decoding is the sibling module
-//! [`decode`](crate::decode).
+//! [`QuotedPrintableEncode`] takes the input chunk by chunk; [`encode`] and
+//! `encode_vec` run it once over a whole input. Decoding is the
+//! sibling module [`decode`](crate::decode).
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-use crate::queue::Queue;
+use crate::{edge::Edge, is_blank, is_plain, mask, window};
 
 /// The most characters a line holds before its soft break `=`.
-const LINE_CONTENT: usize = 75;
+const LINE: usize = 75;
 
-/// The longest output of one input byte: a pending blank, a pending CR and
-/// the byte itself, each escaped after a CRLF soft break.
-const STEP_MAX: usize = 3 * (3 + 3);
+/// The most output bytes a block touches: 32 escapes, two soft breaks, and a
+/// run copied whole past them.
+const ROOM: usize = 3 * 32 + 6 + 32;
 
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
+/// The input the encoder carries: a block.
+const CARRY: usize = 32;
+
+/// The output the encoder queues: what a block touches.
+const QUEUE: usize = ROOM;
 
 /// I/O-free quoted-printable encoder, resumed with the caller's input and
 /// output buffers.
@@ -53,9 +57,7 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 pub struct QuotedPrintableEncode {
     opts: QuotedPrintableEncodeOptions,
     column: usize,
-    blank: Option<u8>,
-    cr: bool,
-    queue: Queue<STEP_MAX>,
+    edge: Edge<CARRY, QUEUE>,
 }
 
 impl QuotedPrintableEncode {
@@ -64,30 +66,23 @@ impl QuotedPrintableEncode {
         Self {
             opts,
             column: 0,
-            blank: None,
-            cr: false,
-            queue: Queue::new(),
+            edge: Edge::new(),
         }
     }
 
     /// Encodes as much of `src` as fits in `dst`.
     ///
     /// The caller drains `dst` and resumes with the rest of `src` or the
-    /// next chunk; one byte of room always lets the encoder progress.
+    /// next chunk; one byte of room always lets the encoder progress. The
+    /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableEncodeOutput {
-        let mut read = 0;
-        let mut written = 0;
+        let (opts, column) = (self.opts, &mut self.column);
+        let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
+            let [read, written] = blocks(src, dst, last, opts, column);
+            [read, written, 0]
+        });
 
-        loop {
-            written += self.queue.drain(&mut dst[written..]);
-
-            if !self.queue.is_empty() || read == src.len() {
-                return QuotedPrintableEncodeOutput { read, written };
-            }
-
-            self.step(src[read]);
-            read += 1;
-        }
+        QuotedPrintableEncodeOutput { read, written }
     }
 
     /// Ends the input: writes what is still queued and the carried space,
@@ -96,105 +91,12 @@ impl QuotedPrintableEncode {
     /// Returns the bytes written, or none, writing nothing, when `dst` is
     /// too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
-        if self.cr {
-            self.cr = false;
-
-            if let Some(blank) = self.blank.take() {
-                self.literal(blank);
-            }
-
-            self.escape(b'\r');
-        } else if let Some(blank) = self.blank.take() {
-            self.escape(blank);
-        }
-
-        if dst.len() < self.queue.len() {
-            return None;
-        }
-
-        Some(self.queue.drain(dst))
-    }
-
-    /// Encodes one byte into the queue, deciding first what the carried
-    /// bytes become now that this one follows them.
-    fn step(&mut self, byte: u8) {
-        let text = !self.opts.binary;
-
-        if self.cr {
-            self.cr = false;
-
-            if byte == b'\n' {
-                if let Some(blank) = self.blank.take() {
-                    self.escape(blank);
-                }
-
-                return self.hard_break();
-            }
-
-            if let Some(blank) = self.blank.take() {
-                self.literal(blank);
-            }
-
-            self.escape(b'\r');
-        }
-
-        if let Some(blank) = self.blank {
-            match byte {
-                b'\n' if text => {
-                    self.blank = None;
-                    self.escape(blank);
-                    return self.hard_break();
-                }
-                b'\r' if text => {
-                    self.cr = true;
-                    return;
-                }
-                _ => {
-                    self.blank = None;
-                    self.literal(blank);
-                }
-            }
-        }
-
-        match byte {
-            b' ' | b'\t' => self.blank = Some(byte),
-            b'\n' if text => self.hard_break(),
-            b'\r' if text => self.cr = true,
-            b'!'..=b'<' | b'>'..=b'~' => self.literal(byte),
-            _ => self.escape(byte),
-        }
-    }
-
-    fn literal(&mut self, byte: u8) {
-        self.room(1);
-        self.queue.push(&[byte]);
-        self.column += 1;
-    }
-
-    fn escape(&mut self, byte: u8) {
-        self.room(3);
-        let hex = [
-            b'=',
-            HEX[usize::from(byte >> 4)],
-            HEX[usize::from(byte & 0xf)],
-        ];
-        self.queue.push(&hex);
-        self.column += 3;
-    }
-
-    /// Ends the line with a soft break when `len` more characters would
-    /// pass its content.
-    fn room(&mut self, len: usize) {
-        if self.column + len > LINE_CONTENT {
-            self.queue.push(b"=");
-            self.queue.push(self.opts.eol.bytes());
-            self.column = 0;
-        }
-    }
-
-    fn hard_break(&mut self) {
-        self.queue.push(self.opts.eol.bytes());
-        self.column = 0;
+        let mut column = self.column;
+        let written = self.edge.finish(dst, |src, dst| {
+            blocks(src, dst, true, self.opts, &mut column)[1]
+        })?;
+        self.column = column;
+        Some(written)
     }
 }
 
@@ -220,10 +122,11 @@ pub enum QuotedPrintableEol {
 }
 
 impl QuotedPrintableEol {
-    const fn bytes(self) -> &'static [u8] {
+    /// The soft line break: `=` and the line ending.
+    const fn soft_break(self) -> &'static [u8] {
         match self {
-            Self::Crlf => b"\r\n",
-            Self::Lf => b"\n",
+            Self::Crlf => b"=\r\n",
+            Self::Lf => b"=\n",
         }
     }
 }
@@ -240,14 +143,13 @@ pub struct QuotedPrintableEncodeOutput {
 /// Encodes the whole of `src` into `dst`, returning the bytes written.
 ///
 /// Returns none, writing nothing, when `dst` is shorter than
-/// [`encoded_len_max`] asks.
+/// [`encoded_len_max`] asks. Within that length, the bytes of `dst` past the
+/// ones written may be overwritten.
 pub fn encode(src: &[u8], dst: &mut [u8], opts: QuotedPrintableEncodeOptions) -> Option<usize> {
-    let len = encoded_len_max(src.len(), opts)?;
-    let dst = dst.get_mut(..len)?;
+    let dst = dst.get_mut(..encoded_len_max(src.len(), opts)?)?;
     let mut encoder = QuotedPrintableEncode::new(opts);
-    let output = encoder.resume(src, dst);
-    let end = encoder.finish(&mut dst[output.written..])?;
-    Some(output.written + end)
+    let written = encoder.resume(src, dst).written;
+    Some(written + encoder.finish(&mut dst[written..])?)
 }
 
 /// Encodes the whole of `src` at the end of `out`.
@@ -270,8 +172,129 @@ pub fn encode_vec(src: &[u8], out: &mut Vec<u8>, opts: QuotedPrintableEncodeOpti
 /// Every byte takes at most three characters, and a soft break follows at
 /// least 73 characters, so at least 25 input bytes.
 pub fn encoded_len_max(len: usize, opts: QuotedPrintableEncodeOptions) -> Option<usize> {
-    let breaks = (len / 25 + 1).checked_mul(1 + opts.eol.bytes().len())?;
+    let breaks = (len / 25 + 1).checked_mul(opts.eol.soft_break().len())?;
     len.checked_mul(3)?.checked_add(breaks)
+}
+
+/// Encodes `src` into `dst` from `column` in blocks of 32 bytes, as many as
+/// fit, returning the bytes read and written.
+///
+/// Each block reads the 2 bytes after it ahead. Unless `last` tells that the
+/// input ends with `src`, a space, tab or CR that may end a line is left
+/// unread when `src` ends before telling.
+fn blocks(
+    src: &[u8],
+    dst: &mut [u8],
+    last: bool,
+    opts: QuotedPrintableEncodeOptions,
+    column: &mut usize,
+) -> [usize; 2] {
+    let text = !opts.binary;
+    let soft = opts.eol.soft_break();
+    let mut soft_word = [0; 4];
+    soft_word[..soft.len()].copy_from_slice(soft);
+    let eol = u32::from_le_bytes(soft_word) >> 8;
+
+    let mut read = 0;
+    let mut written = 0;
+    let mut col = *column;
+
+    while let Some(out) = dst.get_mut(written..written + ROOM) {
+        let src = &src[read..];
+        let mut buffer = [0; 64];
+        let w = window(src, &mut buffer);
+        let mut cut = src.len().min(34);
+
+        if !last && text && w[..cut].ends_with(b"\r") {
+            cut -= 1;
+        }
+
+        if !last && w[..cut].last().is_some_and(|&byte| is_blank(byte)) {
+            cut -= 1;
+        }
+
+        let len = cut.min(32);
+
+        if len == 0 {
+            break;
+        }
+
+        let breaks = |at: usize| text && (w[at] == b'\n' || w[at..].starts_with(b"\r\n"));
+        let end = if src.len() > len { breaks(len) } else { last };
+        let mut events = !mask(w, is_plain) & ((1u64 << len) - 1) as u32;
+
+        if end && is_blank(w[len - 1]) {
+            events |= 1 << (len - 1);
+        }
+
+        let mut from = 0;
+        let mut n = 0;
+
+        loop {
+            let at = if events == 0 {
+                len
+            } else {
+                events.trailing_zeros() as usize
+            };
+            let line = at < len && breaks(at);
+
+            if line && at > from && is_blank(w[at - 1]) {
+                events |= 1 << (at - 1);
+                continue;
+            }
+
+            let mut run = at - from;
+
+            if col + run > LINE {
+                let first = LINE - col;
+                out[n..][..32].copy_from_slice(&w[from..][..32]);
+                out[n + first..][..4].copy_from_slice(&soft_word);
+                n += first + soft.len();
+                from += first;
+                run -= first;
+                col = 0;
+            }
+
+            out[n..][..32].copy_from_slice(&w[from..][..32]);
+            n += run;
+            col += run;
+
+            if at == len {
+                break;
+            }
+
+            let lf = line && w[at] == b'\n';
+            let width = if line { 0 } else { 3 };
+
+            if col + width > LINE {
+                out[n..][..4].copy_from_slice(&soft_word);
+                n += soft.len();
+                col = 0;
+            }
+
+            let word = if lf {
+                eol
+            } else if line {
+                0
+            } else {
+                let digits = b"0123456789ABCDEF";
+                let [high, low] = [w[at] >> 4, w[at] & 0xf].map(|nibble| digits[nibble as usize]);
+                u32::from_le_bytes([b'=', high, low, 0])
+            };
+
+            out[n..][..4].copy_from_slice(&word.to_le_bytes());
+            n += if lf { soft.len() - 1 } else { width };
+            col = if lf { 0 } else { col + width };
+            from = at + 1;
+            events &= events - 1;
+        }
+
+        read += len;
+        written += n;
+    }
+
+    *column = col;
+    [read, written]
 }
 
 #[cfg(test)]
@@ -373,7 +396,7 @@ mod tests {
                 src = &src[output.read..];
             }
 
-            let mut tail = [0; STEP_MAX];
+            let mut tail = [0; QUEUE];
             let end = encoder.finish(&mut tail).unwrap();
             out.extend_from_slice(&tail[..end]);
             assert_eq!(out, encoded(&input, opts));

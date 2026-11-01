@@ -1,14 +1,23 @@
 //! # quoted-printable-codec
 //!
 //! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7),
-//! lenient as mail needs it, `no_std`, with no dependency and no I/O.
+//! lenient as mail needs it, `no_std`, with no dependency, no I/O and no
+//! unsafe code.
 //!
-//! [`encode`] and [`decode`] hold the API: [`QuotedPrintableEncode`] and [`QuotedPrintableDecode`]
-//! take the caller's input and output buffers chunk by chunk, as any I/O-free
-//! coroutine does; the one-shot functions run them once over a whole input.
+//! [`encode`] and [`decode`] hold the API: [`QuotedPrintableEncode`] and
+//! [`QuotedPrintableDecode`] take the caller's input and output buffers chunk
+//! by chunk, as any I/O-free coroutine does; the one-shot functions take a
+//! whole input at once.
 //!
-//! The implementation is scalar, byte by byte: it follows the rules of
-//! encodify 1.0.2's quoted-printable module, with none of its kernels yet.
+//! Both directions read their input in blocks of 32 bytes. A block takes a
+//! bitmask of its special bytes, built 16 lanes at a time in a shape
+//! compilers turn into vector compares on any target, and walks its set bits
+//! only: escapes, soft and hard line breaks, each literal run between them
+//! copied whole. The decoder leaves to token steps, byte by byte, what a
+//! block does not decide alone: malformed escapes, bare CRs, blanks before a
+//! line break and the end of the input. The coroutines run the blocks
+//! straight between the caller's buffers, and keep only the few bytes they
+//! cannot decide yet, or have no room for, between two calls.
 //!
 //! ```
 //! use quoted_printable_codec::{
@@ -41,5 +50,176 @@
 extern crate alloc;
 
 pub mod decode;
+mod edge;
 pub mod encode;
-mod queue;
+
+/// The bytes both directions copy as they are: printable ASCII but `=`,
+/// space and tab.
+const fn is_plain(byte: u8) -> bool {
+    (byte.wrapping_sub(b' ') < 0x5f) & (byte != b'=') | (byte == b'\t')
+}
+
+const fn is_blank(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// The lanes of `bytes` in `class`, a bit each, in a shape compilers turn
+/// into vector compares.
+#[inline(never)]
+fn mask(bytes: &[u8], class: impl Fn(u8) -> bool) -> u32 {
+    // NOTE: compilers vectorize a fold of 16 lanes, not one of 32.
+    let half = |bytes: &[u8]| (0..16).fold(0, |mask, i| mask | (class(bytes[i]) as u32) << i);
+    half(&bytes[..16]) | half(&bytes[16..32]) << 16
+}
+
+/// The first 64 bytes of `src`, padded into `buffer` when fewer, for a block
+/// to read its 32 bytes, the 2 after them, and runs copied out whole.
+///
+/// NOTE: reading `src` itself spares the stall of reading a buffer just
+/// written at other offsets.
+fn window<'a>(src: &'a [u8], buffer: &'a mut [u8; 64]) -> &'a [u8] {
+    if let Some(src) = src.get(..64) {
+        return src;
+    }
+
+    for (buffer, src) in buffer.chunks_mut(16).zip(src.chunks(16)) {
+        buffer[..src.len()].copy_from_slice(src);
+    }
+
+    buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+
+    use crate::{decode::*, encode::*};
+
+    /// A xorshift stream, the same every run.
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as usize % n
+        }
+    }
+
+    /// Bodies of up to 300 bytes, mostly the bytes both directions treat
+    /// apart.
+    fn bodies(random: &mut Random) -> Vec<Vec<u8>> {
+        let bytes = b"aaaaaaaaaaaaaaaaaaaaaaaa==== \t\t\r\n\r\n09AFaf\x00\x7f\xc3\xff";
+
+        (0..2000)
+            .map(|_| {
+                let len = random.below(300);
+                (0..len).map(|_| bytes[random.below(bytes.len())]).collect()
+            })
+            .collect()
+    }
+
+    fn options() -> [QuotedPrintableEncodeOptions; 4] {
+        [false, true]
+            .map(|binary| {
+                [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf]
+                    .map(|eol| QuotedPrintableEncodeOptions { eol, binary })
+            })
+            .concat()
+            .try_into()
+            .unwrap()
+    }
+
+    fn encoded(src: &[u8], opts: QuotedPrintableEncodeOptions) -> Vec<u8> {
+        let mut out = vec![0; encoded_len_max(src.len(), opts).unwrap()];
+        let written = encode(src, &mut out, opts).unwrap();
+        out.truncate(written);
+        out
+    }
+
+    fn decoded(src: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = vec![0; decoded_len_max(src.len())];
+        let output = decode(src, &mut out).unwrap();
+        out.truncate(output.written);
+        (out, output.clean)
+    }
+
+    #[test]
+    fn every_split_gives_the_same_output() {
+        let mut random = Random(0x1234_5678_9abc_def1);
+
+        for body in bodies(&mut random) {
+            for opts in options() {
+                let mut encoder = QuotedPrintableEncode::new(opts);
+                let mut out = Vec::new();
+
+                for chunk in body.chunks(1 + random.below(40)) {
+                    let mut chunk = chunk;
+
+                    while !chunk.is_empty() {
+                        let mut room = vec![0; 1 + random.below(200)];
+                        let output = encoder.resume(chunk, &mut room);
+                        out.extend_from_slice(&room[..output.written]);
+                        chunk = &chunk[output.read..];
+                    }
+                }
+
+                let mut room = vec![0; 300];
+                let end = encoder.finish(&mut room).unwrap();
+                out.extend_from_slice(&room[..end]);
+                assert_eq!(out, encoded(&body, opts));
+            }
+
+            for src in [
+                body.clone(),
+                encoded(&body, QuotedPrintableEncodeOptions::default()),
+            ] {
+                let mut decoder = QuotedPrintableDecode::new();
+                let mut out = Vec::new();
+
+                for chunk in src.chunks(1 + random.below(40)) {
+                    let mut chunk = chunk;
+
+                    while !chunk.is_empty() {
+                        let mut room = vec![0; 1 + random.below(100)];
+                        let output = decoder.resume(chunk, &mut room);
+                        out.extend_from_slice(&room[..output.written]);
+                        chunk = &chunk[output.read..];
+                    }
+                }
+
+                let mut room = vec![0; 300];
+                let end = decoder.finish(&mut room).unwrap();
+                out.extend_from_slice(&room[..end.written]);
+                assert_eq!((out, end.clean), decoded(&src));
+            }
+        }
+    }
+
+    #[test]
+    fn a_frozen_corpus_keeps_its_output() {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut fold = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash = (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+
+        for body in bodies(&mut Random(0x0f1e_2d3c_4b5a_6978)) {
+            for opts in options() {
+                let out = encoded(&body, opts);
+                let (back, clean) = decoded(&out);
+                fold(&out);
+                fold(&back);
+                fold(&[clean as u8]);
+            }
+
+            let (out, clean) = decoded(&body);
+            fold(&out);
+            fold(&[clean as u8]);
+        }
+
+        assert_eq!(hash, 5_623_604_759_311_401_023);
+    }
+}
