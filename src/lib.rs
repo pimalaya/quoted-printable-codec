@@ -84,6 +84,12 @@ const fn is_blank(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
+/// Bytes the guard escapes at a line start: an SMTP end of data, an mbox
+/// `From ` line or a MIME boundary delimiter starts with one.
+const fn is_mark(byte: u8) -> bool {
+    matches!(byte, b'.' | b'F' | b'-')
+}
+
 /// A bit for each lane of `bytes` in `class`, shaped for vector compares.
 #[inline(never)]
 fn mask(bytes: &[u8; 64], class: impl Fn(u8) -> bool) -> u32 {
@@ -168,7 +174,7 @@ mod tests {
     /// Bodies of up to 300 bytes, mostly the bytes both directions treat
     /// apart: 2,000, or 20 under Miri.
     fn bodies(random: &mut Random) -> Vec<Vec<u8>> {
-        let bytes = b"aaaaaaaaaaaaaaaaaaaaaaaa==== \t\t\r\n\r\n09AFaf\x00\x7f\xc3\xff";
+        let bytes = b"aaaaaaaaaaaaaaaaaaaaaaaa==== \t\t\r\n\r\n09AFaf\x00\x7f\xc3\xff.-";
 
         (0..if cfg!(miri) { 20 } else { 2000 })
             .map(|_| {
@@ -178,19 +184,23 @@ mod tests {
             .collect()
     }
 
-    /// Every body mode and line ending under `cpu`.
-    fn codecs(cpu: QuotedPrintableCpu) -> [QuotedPrintableCodec; 4] {
-        [QuotedPrintableMode::Text, QuotedPrintableMode::Binary]
-            .map(|mode| {
-                [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf].map(|eol| QuotedPrintableCodec {
+    /// Every body mode, line ending and guard under `cpu`.
+    fn codecs(cpu: QuotedPrintableCpu) -> Vec<QuotedPrintableCodec> {
+        let modes = [QuotedPrintableMode::Text, QuotedPrintableMode::Binary];
+        let eols = [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf];
+
+        modes
+            .into_iter()
+            .flat_map(|mode| eols.map(|eol| (mode, eol)))
+            .flat_map(|(mode, eol)| {
+                [false, true].map(|guard| QuotedPrintableCodec {
                     cpu,
                     eol,
                     mode,
+                    guard,
                 })
             })
-            .concat()
-            .try_into()
-            .unwrap()
+            .collect()
     }
 
     fn encoded(src: &[u8], codec: QuotedPrintableCodec) -> Vec<u8> {
@@ -284,6 +294,25 @@ mod tests {
     }
 
     #[test]
+    fn guarded_lines_start_with_no_mark_and_decode_back() {
+        let mut random = Random(0x2468_ace0_1357_9bdf);
+
+        for body in bodies(&mut random) {
+            for cpu in available() {
+                for codec in codecs(cpu).into_iter().filter(|codec| codec.guard) {
+                    let out = encoded(&body, codec);
+                    let starts = out.split(|&b| b == b'\n').filter_map(|line| line.first());
+                    assert!(!starts.copied().any(crate::is_mark), "{codec:?}");
+
+                    if codec.mode == QuotedPrintableMode::Binary {
+                        assert_eq!(decoded(&out, codec), (body.clone(), true));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore = "hashes the 2,000 bodies Miri skips")]
     fn a_frozen_corpus_keeps_its_output() {
         for cpu in available() {
@@ -312,7 +341,7 @@ mod tests {
                 fold(&[clean as u8]);
             }
 
-            assert_eq!(hash, 5_623_604_759_311_401_023);
+            assert_eq!(hash, 10_479_309_502_388_201_493);
         }
     }
 

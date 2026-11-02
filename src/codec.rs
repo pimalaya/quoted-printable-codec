@@ -8,11 +8,12 @@ use simd_cpu::SimdCpu;
 
 use crate::cpu::QuotedPrintableCpu;
 
-/// The backend, the mode and the line ending of encoded output.
+/// The backend, the mode, the line ending of encoded output and the line-start
+/// guard.
 ///
 /// A stateless value, built once and used for every call. Defaults to text
-/// with CRLF on the installed token's backend. Another token goes in
-/// [`cpu`](Self::cpu), built with `QuotedPrintableCpu::new`.
+/// with CRLF, unguarded, on the installed token's backend. Another token goes
+/// in [`cpu`](Self::cpu), built with `QuotedPrintableCpu::new`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct QuotedPrintableCodec {
     /// The backend every call runs.
@@ -21,15 +22,23 @@ pub struct QuotedPrintableCodec {
     pub eol: QuotedPrintableEol,
     /// MIME body text or binary, or RFC 2047 encoded-word text.
     pub mode: QuotedPrintableMode,
+    /// Whether encoding escapes a `.`, `F` or `-` starting an output line, in
+    /// text and binary mode, so that no line reads as an SMTP end of data, an
+    /// mbox `From ` line or a MIME boundary delimiter (RFC 2049 3(8)). Q mode
+    /// and decoding ignore it.
+    ///
+    /// Refs: <https://datatracker.ietf.org/doc/html/rfc2049#section-3>
+    pub guard: bool,
 }
 
 impl QuotedPrintableCodec {
-    /// Text with CRLF on the build target's backend, ignoring the installed
-    /// token.
+    /// Text with CRLF, unguarded, on the build target's backend, ignoring the
+    /// installed token.
     pub const BASELINE: Self = Self {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
         mode: QuotedPrintableMode::Text,
+        guard: false,
     };
 }
 

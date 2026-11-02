@@ -112,8 +112,11 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
 }
 
 /// Encodes like the portable walk, in chunks of two groups of 16 bytes.
+///
+/// With `GUARD`, stops before a group where a `.`, `F` or `-` would start a
+/// line, returning 1 as the third count.
 #[target_feature(enable = "avx2,bmi1,lzcnt,popcnt")]
-pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
+pub(crate) fn encode<const TEXT: bool, const CRLF: bool, const GUARD: bool>(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
@@ -170,10 +173,16 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             pick(esc, digits[1], unused),
         ];
 
-        (lanes, [esc, lf, drop].map(|v| mask(v)))
+        let marks = match GUARD {
+            true => mask(or(or(is(a, b'.'), is(a, b'F')), is(a, b'-'))),
+            false => 0,
+        };
+        let [esc, lf, drop] = [esc, lf, drop].map(|v| mask(v));
+
+        (lanes, [esc, lf, drop, marks])
     };
 
-    let mut group = |lanes: [__m128i; 3], masks, n: usize, at| {
+    let mut group = |lanes: [__m128i; 3], [esc, lf, drop, marks]: [u32; 4], n: usize, at| {
         let to = base.wrapping_add(at);
         let keep = lanes.iter().rev().fold(0, |keep, &v| {
             keep << 16 | !_mm_movemask_epi8(v) as u64 & 0xffff
@@ -186,11 +195,11 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             len += unsafe { compress(v, (keep >> (16 * i)) as u32, to.add(len)) };
         }
 
-        let (cut, next) = line(masks, len, col, crlf);
+        let (cut, next) = line([esc, lf, drop], marks, len, col, crlf)?;
         col = next;
 
         let Some(cut) = cut else {
-            return len;
+            return Some(len);
         };
 
         // SAFETY: as above.
@@ -203,7 +212,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             }
         }
 
-        len + soft_len
+        Some(len + soft_len)
     };
 
     while dst.len() - written >= ROOM {
@@ -247,7 +256,13 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             }
 
             let masks = masks.map(|mask| mask >> (16 * i) & first(n));
-            written += group(lanes, masks, n, written);
+
+            let Some(len) = group(lanes, masks, n, written) else {
+                *column = col;
+                return [read + 16 * i, written, 1];
+            };
+
+            written += len;
         }
 
         read += len;

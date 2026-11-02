@@ -14,12 +14,17 @@ The decoder SHALL turn `=XX` into its byte, either case of hex digits accepted a
 
 ### Requirement: Line breaks and trailing blanks
 
-The decoder SHALL keep CRLF and bare LF as they are, drop a bare CR and report it, and delete the spaces and tabs that end a line or the input. It SHALL carry at most 76 such blanks: past them, the oldest are kept as data.
+The decoder SHALL keep CRLF and bare LF as they are, keep a bare CR as data and report it, and delete the spaces and tabs that end a line or the input. It SHALL carry at most 76 such blanks: past them, the oldest are kept as data.
 
 #### Scenario: Too many blanks
 - GIVEN 78 spaces then CRLF
 - WHEN they are decoded
 - THEN the output is 2 spaces then CRLF, reported clean
+
+#### Scenario: Lines ended by CR alone
+- GIVEN `a\rb\r`
+- WHEN it is decoded
+- THEN the output is `a\rb\r`, reported unclean
 
 ### Requirement: Malformed input
 

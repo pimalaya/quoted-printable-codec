@@ -20,6 +20,7 @@ fn codec(mode: QuotedPrintableMode) -> QuotedPrintableCodec {
         cpu: QuotedPrintableCpu::new(SimdCpu::detect()),
         eol: QuotedPrintableEol::Crlf,
         mode,
+        guard: false,
     }
 }
 
@@ -111,6 +112,20 @@ fn encodes(c: &mut Criterion) {
             );
 
             let binary = codec.mode == QuotedPrintableMode::Binary;
+
+            if !binary {
+                let guarded = QuotedPrintableCodec {
+                    guard: true,
+                    ..codec
+                };
+
+                group.bench_with_input(
+                    BenchmarkId::new("quoted-printable-codec guarded", size),
+                    &src,
+                    |b, src| b.iter(|| guarded.encode(black_box(src), &mut out)),
+                );
+            }
+
             let engine = match binary {
                 false => encodify::qp::BODY,
                 true => encodify::qp::BINARY,

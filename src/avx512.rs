@@ -115,8 +115,11 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
 }
 
 /// Encodes like the portable walk, in chunks of three groups of 21 bytes.
+///
+/// With `GUARD`, stops before a group where a `.`, `F` or `-` would start a
+/// line, returning 1 as the third count.
 #[target_feature(enable = "avx512vbmi2,avx512vbmi,bmi1,bmi2,lzcnt,popcnt")]
-pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
+pub(crate) fn encode<const TEXT: bool, const CRLF: bool, const GUARD: bool>(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
@@ -148,11 +151,16 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let high = _mm512_permutexvar_epi8(_mm512_srli_epi16(a, 4), hex);
         let lead = set(set(a, esc, b'='), lf, if crlf { b'\r' } else { b'\n' });
         let low = _mm512_permutexvar_epi8(a, hex);
-        ([lead, set(high, lf, b'\n'), low], [esc, lf, drop])
+        let marks = match GUARD {
+            true => is(a, b'.') | is(a, b'F') | is(a, b'-'),
+            false => 0,
+        };
+
+        ([lead, set(high, lf, b'\n'), low], [esc, lf, drop, marks])
     };
 
-    let mut group = |[lead, high, low]: [__m512i; 3], spread, masks: [u64; 3], n: usize, at| {
-        let [escs, lfs, drops] = masks.map(|mask| _pdep_u64(mask, STARTS));
+    let mut group = |[lead, high, low]: [__m512i; 3], spread, masks: [u64; 4], n: usize, at| {
+        let [escs, lfs, drops, marks] = masks.map(|mask| _pdep_u64(mask, STARTS));
         let starts = _bzhi_u64(STARTS, 3 * n as u32) & !drops;
         let keep = starts | (escs | if crlf { lfs } else { 0 }) << 1 | escs << 2;
         let out = _mm512_permutexvar_epi8(spread, lead);
@@ -168,6 +176,16 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let lz = _lzcnt_u64(starts & upto) as usize;
         let need = (room < len) & (lfs & upto == 0);
         let cut = select_unpredictable(need, 63 ^ lz, 64);
+
+        if GUARD {
+            let wrap = if need { 1 << cut } else { 0 };
+            let starts = (col == 0) as u64 | lfs << (1 + crlf as u32) | wrap;
+
+            if _pext_u64(marks, keep) & starts != 0 {
+                return None;
+            }
+        }
+
         let to = base.wrapping_add(at);
 
         // SAFETY: 68 bytes are left from `to`, as a chunk has `ROOM`.
@@ -180,7 +198,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let wrap = select_unpredictable(need, (len + lz).wrapping_sub(63), col + len);
         let after = (len + _lzcnt_u64(lfs) as usize).wrapping_sub(64 + crlf as usize);
         col = select_unpredictable(lfs == 0, wrap, after);
-        len + select_unpredictable(need, soft_len, 0)
+        Some(len + select_unpredictable(need, soft_len, 0))
     };
 
     // NOTE: the next chunk is read ahead, so that chunks overlap.
@@ -201,7 +219,13 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
 
         for (i, spread) in spreads.into_iter().enumerate() {
             let masks = masks.map(|mask| mask >> (21 * i));
-            written += group(bytes, spread, masks, 21, written);
+
+            let Some(len) = group(bytes, spread, masks, 21, written) else {
+                *column = col;
+                return [read + 21 * i, written, 1];
+            };
+
+            written += len;
         }
 
         read += 63;
@@ -233,7 +257,13 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         }
 
         let masks = masks.map(|mask| mask >> (21 * i) & first(n));
-        written += group(bytes, spread, masks, n, written);
+
+        let Some(len) = group(bytes, spread, masks, n, written) else {
+            *column = col;
+            return [read, written, 1];
+        };
+
+        written += len;
         read += n;
     }
 

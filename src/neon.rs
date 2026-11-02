@@ -104,8 +104,11 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
 }
 
 /// Encodes like the portable walk, in chunks of two groups of 16 bytes.
+///
+/// With `GUARD`, stops before a group where a `.`, `F` or `-` would start a
+/// line, returning 1 as the third count.
 #[target_feature(enable = "neon")]
-pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
+pub(crate) fn encode<const TEXT: bool, const CRLF: bool, const GUARD: bool>(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
@@ -196,7 +199,16 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             }
 
             let masks = [esc, lf, drop].map(|v| mask(v) & first(n));
-            let (cut, next) = line(masks, out, col, crlf);
+            let marks = match GUARD {
+                true => mask(vorrq_u8(vorrq_u8(is(a, b'.'), is(a, b'F')), is(a, b'-'))) & first(n),
+                false => 0,
+            };
+
+            let Some((cut, next)) = line(masks, marks, out, col, crlf) else {
+                *column = col;
+                return [read + 16 * half, written, 1];
+            };
+
             col = next;
 
             if let Some(cut) = cut {

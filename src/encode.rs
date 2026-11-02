@@ -23,7 +23,7 @@ use crate::{avx2, avx512};
 use crate::{
     codec::{QuotedPrintableCodec, QuotedPrintableMode},
     edge::Edge,
-    is_blank, is_plain, mask, pad, window,
+    is_blank, is_mark, is_plain, mask, pad, window,
 };
 
 /// The most characters a line holds before its soft break `=`.
@@ -35,22 +35,27 @@ pub(crate) const LINE: usize = 75;
 /// 51 at most, storing up to 99 past its start.
 pub(crate) const ROOM: usize = 200;
 
-/// Runs the SIMD encoder `$kernel` for the mode and line ending of `$codec`.
+/// Runs the SIMD encoder `$kernel` for the mode, line ending and guard of
+/// `$codec`.
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_feature = "neon")
 ))]
 macro_rules! kernel {
     ($($kernel:ident)::+, $codec:expr, $($arg:expr),+) => {{
-        use crate::codec::{QuotedPrintableEol, QuotedPrintableMode};
+        use crate::codec::{QuotedPrintableEol::*, QuotedPrintableMode};
 
         let binary = $codec.mode == QuotedPrintableMode::Binary;
 
-        match (binary, $codec.eol) {
-            (false, QuotedPrintableEol::Crlf) => $($kernel)::+::<true, true>($($arg),+),
-            (false, QuotedPrintableEol::Lf) => $($kernel)::+::<true, false>($($arg),+),
-            (true, QuotedPrintableEol::Crlf) => $($kernel)::+::<false, true>($($arg),+),
-            (true, QuotedPrintableEol::Lf) => $($kernel)::+::<false, false>($($arg),+),
+        match (binary, $codec.eol, $codec.guard) {
+            (false, Crlf, false) => $($kernel)::+::<true, true, false>($($arg),+),
+            (false, Lf, false) => $($kernel)::+::<true, false, false>($($arg),+),
+            (true, Crlf, false) => $($kernel)::+::<false, true, false>($($arg),+),
+            (true, Lf, false) => $($kernel)::+::<false, false, false>($($arg),+),
+            (false, Crlf, true) => $($kernel)::+::<true, true, true>($($arg),+),
+            (false, Lf, true) => $($kernel)::+::<true, false, true>($($arg),+),
+            (true, Crlf, true) => $($kernel)::+::<false, true, true>($($arg),+),
+            (true, Lf, true) => $($kernel)::+::<false, false, true>($($arg),+),
         }
     }};
 }
@@ -209,21 +214,88 @@ fn blocks(
         (QuotedPrintableMode::Q, _) => words(src, dst),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the token names a backend the CPU supports.
-        (_, crate::cpu::QuotedPrintableBackend::Avx512) if unsafe { avx512::dense(src) } => unsafe {
-            kernel!(avx512::encode, codec, src, dst, last, column)
-        },
+        (_, crate::cpu::QuotedPrintableBackend::Avx512) if unsafe { avx512::dense(src) } => {
+            chain(src, dst, last, codec, column, |src, dst, column| {
+                // SAFETY: as above.
+                unsafe { kernel!(avx512::encode, codec, src, dst, last, column) }
+            })
+        }
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: the token names a backend the CPU supports.
-        (_, crate::cpu::QuotedPrintableBackend::Avx2) => unsafe {
-            kernel!(avx2::encode, codec, src, dst, last, column)
-        },
+        (_, crate::cpu::QuotedPrintableBackend::Avx2) => {
+            chain(src, dst, last, codec, column, |src, dst, column| {
+                // SAFETY: the token names a backend the CPU supports.
+                unsafe { kernel!(avx2::encode, codec, src, dst, last, column) }
+            })
+        }
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        // SAFETY: the token names a backend the CPU supports.
-        (_, crate::cpu::QuotedPrintableBackend::Neon) => unsafe {
-            kernel!(neon::encode, codec, src, dst, last, column)
-        },
-        (QuotedPrintableMode::Binary, _) => walk::<false>(src, dst, last, codec, column),
-        _ => walk::<true>(src, dst, last, codec, column),
+        (_, crate::cpu::QuotedPrintableBackend::Neon) => {
+            chain(src, dst, last, codec, column, |src, dst, column| {
+                // SAFETY: the token names a backend the CPU supports.
+                unsafe { kernel!(neon::encode, codec, src, dst, last, column) }
+            })
+        }
+        _ => portable(src, dst, last, codec, column),
+    }
+}
+
+/// Runs the SIMD encoder `kernel`, and the portable walk over the bytes it
+/// leaves to it, until it stops for room or input.
+///
+/// A guarded kernel stops before a group where a `.`, `F` or `-` would start
+/// a line, returning 1 as its third count: the walk escapes it, then the
+/// kernel resumes from the walk's column.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
+fn chain(
+    src: &[u8],
+    dst: &mut [u8],
+    last: bool,
+    codec: QuotedPrintableCodec,
+    column: &mut usize,
+    mut kernel: impl FnMut(&[u8], &mut [u8], &mut usize) -> [usize; 3],
+) -> [usize; 3] {
+    let mut read = 0;
+    let mut written = 0;
+
+    loop {
+        let [r, w, stop] = kernel(&src[read..], &mut dst[written..], column);
+        read += r;
+        written += w;
+
+        if stop == 0 {
+            return [read, written, 0];
+        }
+
+        // NOTE: 48 bytes cover the group the kernel stopped before.
+        let n = (src.len() - read).min(48);
+        let ends = last && n == src.len() - read;
+        let [r, w, _] = portable(&src[read..][..n], &mut dst[written..], ends, codec, column);
+        read += r;
+        written += w;
+
+        if r == 0 {
+            return [read, written, 0];
+        }
+    }
+}
+
+/// Runs [`walk`] built for the mode and guard of `codec`.
+fn portable(
+    src: &[u8],
+    dst: &mut [u8],
+    last: bool,
+    codec: QuotedPrintableCodec,
+    column: &mut usize,
+) -> [usize; 3] {
+    let binary = codec.mode == QuotedPrintableMode::Binary;
+
+    match (binary, codec.guard) {
+        (false, false) => walk::<true, false>(src, dst, last, codec, column),
+        (true, false) => walk::<false, false>(src, dst, last, codec, column),
+        (false, true) => walk::<true, true>(src, dst, last, codec, column),
+        (true, true) => walk::<false, true>(src, dst, last, codec, column),
     }
 }
 
@@ -257,7 +329,7 @@ const fn is_phrase(byte: u8) -> bool {
 }
 
 /// The soft break an AVX2 or NEON group needs, if any, and the column after
-/// it.
+/// it, or none when one of the guarded bytes `marks` would start a line.
 ///
 /// Takes the group's escape, line feed and dropped CR masks, its output
 /// length and the column before it. The break goes before the unit crossing
@@ -269,32 +341,46 @@ const fn is_phrase(byte: u8) -> bool {
 ))]
 pub(crate) fn line(
     [esc, lf, drop]: [u32; 3],
+    marks: u32,
     len: usize,
     col: usize,
     crlf: bool,
-) -> (Option<usize>, usize) {
+) -> Option<(Option<usize>, usize)> {
     let at = |i: u32| {
         let count = |mask: u32| (mask & !(u32::MAX << i)).count_ones() as usize;
         i as usize + 2 * count(esc) + crlf as usize * count(lf) - count(drop)
     };
     let room = LINE - col;
     let need = room < len && (lf == 0 || at(lf.trailing_zeros()) > room);
-    let cut = need.then(|| {
+    let first = need.then(|| {
         let starts = (0..).take_while(|&i| at(i) <= room);
-        starts.filter(|&i| drop >> i & 1 == 0).last().map_or(0, at)
+        starts.filter(|&i| drop >> i & 1 == 0).last().unwrap_or(0)
     });
+
+    if marks != 0 {
+        let wrap = first.map_or(0, |i| 1 << i);
+
+        if marks & ((col == 0) as u32 | lf << 1 | wrap) != 0 {
+            return None;
+        }
+    }
+
+    let cut = first.map(at);
     let col = match (lf, cut) {
         (0, Some(cut)) => len - cut,
         (0, None) => col + len,
         _ => len - at(31 - lf.leading_zeros()) - 1 - crlf as usize,
     };
 
-    (cut, col)
+    Some((cut, col))
 }
 
 /// The portable loop of [`blocks`]: 32-byte blocks reading 2 bytes ahead,
 /// built per mode, as a per-byte mode test costs a fifth of binary encoding.
-fn walk<const TEXT: bool>(
+///
+/// With `GUARD`, a `.`, `F` or `-` is an event too, a literal of width 1
+/// escaped when it starts a line.
+fn walk<const TEXT: bool, const GUARD: bool>(
     src: &[u8],
     dst: &mut [u8],
     last: bool,
@@ -336,6 +422,10 @@ fn walk<const TEXT: bool>(
         // NOTE: bit `len` stands for the block's end.
         let mut events = !mask(w, is_plain) as u64 & !(u64::MAX << len) | 1 << len;
 
+        if GUARD {
+            events |= mask(w, is_mark) as u64 & !(u64::MAX << len);
+        }
+
         if end && is_blank(w[len - 1]) {
             events |= 1 << (len - 1);
         }
@@ -356,8 +446,10 @@ fn walk<const TEXT: bool>(
             }
 
             let n = at + off;
+            let mark = GUARD && at < len && is_mark(w[at]);
+            let width = if mark { 1 } else { 3 };
 
-            if n + 3 > lim && (n > lim || !line && at < len) {
+            if n + width > lim && (n > lim || !line && at < len) {
                 let cut = n.min(lim);
                 out[(from + off) & 127..][..32].copy_from_slice(&w[from & 31..][..32]);
                 out[cut & 127..][..4].copy_from_slice(&soft);
@@ -368,8 +460,10 @@ fn walk<const TEXT: bool>(
 
             out[(from + off) & 127..][..32].copy_from_slice(&w[from & 31..][..32]);
 
-            // NOTE: the end's bit takes an escape too, past the output.
-            if !line {
+            // NOTE: a mark within its line was copied with the run, and the
+            // end's bit takes an escape too, past the output.
+            if mark && at + off + LINE != lim {
+            } else if !line {
                 out[(at + off) & 127..][..4].copy_from_slice(&ESCAPES[w[at] as usize]);
                 off += 2;
             } else if w[at] == b'\n' {
@@ -423,6 +517,12 @@ mod tests {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
         mode: QuotedPrintableMode::Text,
+        guard: false,
+    };
+
+    const GUARDED: QuotedPrintableCodec = QuotedPrintableCodec {
+        guard: true,
+        ..TEXT
     };
 
     const BINARY: QuotedPrintableCodec = QuotedPrintableCodec {
@@ -481,6 +581,18 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_before_a_lone_cr_stays_within_the_line() {
+        for column in 60..80 {
+            let mut input = vec![b'a'; column];
+            input.extend_from_slice(b" \rb");
+
+            for line in text(&input).split(|&b| b == b'\n') {
+                assert!(line.strip_suffix(b"\r").unwrap_or(line).len() <= 76);
+            }
+        }
+    }
+
+    #[test]
     fn line_final_blanks_are_escaped() {
         assert_eq!(text(b"a \nb\t\r\nc "), b"a=20\r\nb=09\r\nc=20");
         assert_eq!(text(b"a  b"), b"a  b");
@@ -516,6 +628,61 @@ mod tests {
     }
 
     #[test]
+    fn guarded_marks_starting_a_line_are_escaped() {
+        let input = b".\nFrom x\n-- \na.F-";
+        assert_eq!(text(input), b".\r\nFrom x\r\n--=20\r\na.F-");
+        assert_eq!(
+            encoded(input, GUARDED),
+            b"=2E\r\n=46rom x\r\n=2D-=20\r\na.F-"
+        );
+
+        let binary = QuotedPrintableCodec {
+            guard: true,
+            ..BINARY
+        };
+
+        assert_eq!(encoded(b"-\n-", binary), b"=2D=0A-");
+        assert_eq!(encoded(b"-\n-", Q), b"-=0A-");
+    }
+
+    #[test]
+    fn a_mark_pushed_to_a_line_start_is_escaped() {
+        let mut input = vec![b'a'; 75];
+        input.push(b'F');
+        input.extend_from_slice(&[b'a'; 10]);
+        let mut expected = vec![b'a'; 75];
+        expected.extend_from_slice(b"=\r\n=46");
+        expected.extend_from_slice(&[b'a'; 10]);
+        assert_eq!(encoded(&input, GUARDED), expected);
+
+        for eol in [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf] {
+            for mode in [QuotedPrintableMode::Text, QuotedPrintableMode::Binary] {
+                let codec = QuotedPrintableCodec {
+                    eol,
+                    mode,
+                    ..GUARDED
+                };
+
+                for column in if cfg!(miri) { 70..80 } else { 60..160 } {
+                    for mark in *b".F-" {
+                        let mut input = vec![b'a'; column];
+                        input.push(mark);
+                        input.extend_from_slice(&[mark; 80]);
+                        input.extend_from_slice(b"\n.\n");
+                        let out = encoded(&input, codec);
+
+                        for line in out.split(|&b| b == b'\n') {
+                            let line = line.strip_suffix(b"\r").unwrap_or(line);
+                            assert!(line.len() <= 76);
+                            assert!(!line.first().is_some_and(|&b| crate::is_mark(b)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_length_bound_holds() {
         for len in 0..200 {
             for byte in [b'x', b' ', b'\n', 0xff] {
@@ -534,7 +701,7 @@ mod tests {
 
         for codec in available()
             .iter()
-            .flat_map(|&cpu| [TEXT, BINARY, Q].map(|c| QuotedPrintableCodec { cpu, ..c }))
+            .flat_map(|&cpu| [TEXT, GUARDED, BINARY, Q].map(|c| QuotedPrintableCodec { cpu, ..c }))
         {
             let mut encoder = QuotedPrintableEncode::new(codec);
             let mut src = &input[..];

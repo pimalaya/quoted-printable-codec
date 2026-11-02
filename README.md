@@ -19,7 +19,7 @@ Quoted-printable encoder and decoder with SIMD and no_std
 
 - **SIMD**: AVX-512 and AVX2 on x86_64, NEON on aarch64, portable code anywhere else.
 - **Fast**: up to 44x faster than encodify and 63x faster than the quoted_printable crate, see the [benchmarks](#benchmarks).
-- **MIME bodies**: text or binary, in lines of at most 76 characters ended by CRLF or LF.
+- **MIME bodies**: text or binary, in lines of at most 76 characters ended by CRLF or LF, optionally guarded so no line starts with `.`, `F` or `-`.
 - **Header words**: the RFC 2047 Q encoding of encoded words.
 - **Lenient decoding**: never fails, follows the robust rules of RFC 2045, reports whether the input was clean.
 - **I/O-free**: encode and decode chunk by chunk into your own buffers.
@@ -31,9 +31,11 @@ Quoted-printable encoder and decoder with SIMD and no_std
 |--------|------------------------------------------------------------------------------------------------------------------------|
 | [2045] | The quoted-printable content transfer encoding (6.7): escapes, soft line breaks, lines of 76 characters, robust decoding |
 | [2047] | The Q encoding of encoded words (4.2), with the literal set a phrase allows (5(3)); splitting text into words is the caller's |
+| [2049] | The optional guard of 3(8): no encoded line starts with `.`, `F` or `-` |
 
 [2045]: https://www.rfc-editor.org/rfc/rfc2045#section-6.7
 [2047]: https://www.rfc-editor.org/rfc/rfc2047#section-4.2
+[2049]: https://www.rfc-editor.org/rfc/rfc2049#section-3
 
 ## Usage
 

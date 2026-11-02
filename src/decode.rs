@@ -2,9 +2,9 @@
 //!
 //! Lenient quoted-printable decoding of a MIME body, as RFC 2045 6.7 asks of
 //! robust implementations. Escapes decode in either case, soft breaks join,
-//! trailing blanks go, CRLF and LF stay, a bare CR is dropped, a malformed
-//! escape keeps its `=`. Decoding never fails: it returns the bytes and
-//! whether the input was clean.
+//! trailing blanks go, CRLF and LF stay, a bare CR stays and is reported, a
+//! malformed escape keeps its `=`. Decoding never fails: it returns the bytes
+//! and whether the input was clean.
 //!
 //! Q mode (RFC 2047) reads `_` as a space and escapes in either case, and
 //! keeps other bytes. Only a malformed escape makes it unclean, as words in
@@ -89,8 +89,8 @@ impl QuotedPrintableDecode {
         }
     }
 
-    /// Ends the input: writes the queue and an unfinished escape, and drops
-    /// trailing blanks and CR.
+    /// Ends the input: writes the queue, an unfinished escape and a last CR,
+    /// and drops trailing blanks.
     ///
     /// Returns none, writing nothing, when `dst` is too short; otherwise
     /// resets the decoder.
@@ -252,11 +252,13 @@ fn tokens(
                 written -= held;
                 return [read, written, if last { 0 } else { held }];
             }
-            // NOTE: a bare CR, as blocks stop on nothing else.
+            // NOTE: a bare CR, as blocks stop on nothing else. It is data, so
+            // the blanks before it stay.
             _ => {
+                dst[written] = b'\r';
                 *dirty = true;
                 read += 1;
-                continue;
+                written += 1;
             }
         }
 
@@ -420,6 +422,7 @@ mod tests {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
         mode: QuotedPrintableMode::Text,
+        guard: false,
     };
 
     const Q: QuotedPrintableCodec = QuotedPrintableCodec {
@@ -475,9 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_cr_is_dropped_and_reported() {
-        assert_eq!(decoded(CODEC, b"a\rb"), unclean(b"ab"));
-        assert_eq!(decoded(CODEC, b"a \r"), unclean(b"a"));
+    fn a_bare_cr_is_kept_and_reported() {
+        assert_eq!(decoded(CODEC, b"a\rb\r"), unclean(b"a\rb\r"));
+        assert_eq!(decoded(CODEC, b"a \r"), unclean(b"a \r"));
+        assert_eq!(decoded(CODEC, b"a \r\r\nb"), unclean(b"a \r\r\nb"));
+        assert_eq!(decoded(CODEC, b"a\r \n"), unclean(b"a\r\n"));
     }
 
     #[test]
@@ -486,7 +491,7 @@ mod tests {
         assert_eq!(decoded(CODEC, b"a=4zb"), unclean(b"a=4zb"));
         assert_eq!(decoded(CODEC, b"a=4"), unclean(b"a=4"));
         assert_eq!(decoded(CODEC, b"a= b"), unclean(b"a= b"));
-        assert_eq!(decoded(CODEC, b"a= \rb"), unclean(b"a= b"));
+        assert_eq!(decoded(CODEC, b"a= \rb"), unclean(b"a= \rb"));
         assert_eq!(decoded(CODEC, b"a==41"), unclean(b"a=A"));
     }
 

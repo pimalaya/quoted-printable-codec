@@ -30,6 +30,20 @@ The encoder SHALL insert a soft break (`=` and the line ending) before a literal
 - WHEN they are encoded
 - THEN the output is 75 `x`, `=`, CRLF, 5 `x`: 83 bytes
 
+### Requirement: The line-start guard
+
+With `guard`, in text and binary mode, the encoder SHALL escape a `.`, `F` or `-` that starts an output line, the first byte of the input or the first after a hard or soft break, so that no output line starts with one (RFC 2049 3(8)); a soft break SHALL count the three columns of a byte it pushes to a line start. Without `guard`, and in Q mode, the encoder SHALL write those bytes as any other.
+
+#### Scenario: Markers at line starts
+- GIVEN `.\nFrom x\n-- \n` in text mode with `guard`
+- WHEN it is encoded with CRLF
+- THEN the output is `=2E`, CRLF, `=46rom x`, CRLF, `=2D-=20`, CRLF
+
+#### Scenario: A marker pushed to a line start
+- GIVEN 75 bytes `a` then `F` then 10 bytes `a`, in text mode with `guard`
+- WHEN it is encoded
+- THEN the output is 75 `a`, `=`, CRLF, `=46`, 10 `a`, and no line exceeds 76 characters
+
 ### Requirement: The Q encoding
 
 In Q mode, the encoder SHALL write letters, digits and `!*+-/` literally, a space as `_` and every other byte as `=XX` with uppercase hex digits, and no line break of any kind (RFC 2047 4.2 and 5(3)); the line ending is ignored.

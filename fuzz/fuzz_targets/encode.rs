@@ -2,7 +2,8 @@
 //! resumed over any chunks and room, to the bytes of the portable one, as
 //! many as `encoded_len` tells, which decode back clean to the input, its
 //! line breaks as the mode writes them: a body in lines of at most 76
-//! characters, Q text with no line break at all.
+//! characters, none starting with `.`, `F` or `-` when guarded, Q text with
+//! no line break at all.
 
 #![no_main]
 
@@ -34,6 +35,7 @@ fuzz_target!(|data: &[u8]| {
         cpu: QuotedPrintableCpu::new(SimdCpu::NONE),
         eol,
         mode,
+        guard: options / 6 % 2 == 1,
     };
 
     let expected = one_shot(input, portable);
@@ -56,6 +58,10 @@ fuzz_target!(|data: &[u8]| {
             "{line:?}"
         );
         assert!(!line.contains(&b'\r'), "{line:?}");
+
+        if portable.guard && mode != QuotedPrintableMode::Q {
+            assert!(!line.first().is_some_and(|byte| b".F-".contains(byte)));
+        }
     }
 
     let mut decoded = vec![0; portable.decoded_len_max(expected.len())];
