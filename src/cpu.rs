@@ -2,8 +2,8 @@
 //!
 //! [`QuotedPrintableCpu`], the backend a
 //! [`QuotedPrintableCodec`](crate::codec::QuotedPrintableCodec) runs, picked
-//! from the [`SimdCpu`] the application hands over: the library never detects
-//! CPU features.
+//! from a [`SimdCpu`]: one the caller hands over, or by default the one the
+//! application installed. The library never detects CPU features.
 
 use simd_cpu::SimdCpu;
 
@@ -44,8 +44,11 @@ impl QuotedPrintableCpu {
 }
 
 impl Default for QuotedPrintableCpu {
+    /// The backend of [`SimdCpu::current`]: the token the application
+    /// installed, or [`SimdCpu::BASELINE`] when it installed none.
+    #[inline]
     fn default() -> Self {
-        const { Self::new(SimdCpu::BASELINE) }
+        Self::new(SimdCpu::current())
     }
 }
 

@@ -75,9 +75,12 @@ impl QuotedPrintableDecode {
     /// Builds a decoder running the backend of `codec`, whatever its line
     /// ending: the text of encoded words in Q mode, a MIME body otherwise.
     pub fn new(codec: QuotedPrintableCodec) -> Self {
+        // NOTE: not `..Self::default()`, which would build a default codec,
+        // reading the installed token, only to drop it.
         Self {
             codec,
-            ..Self::default()
+            edge: Edge::default(),
+            dirty: false,
         }
     }
 

@@ -7,13 +7,18 @@
 //! a whole input; the coroutines of those modules take it to work chunk by
 //! chunk.
 
+use simd_cpu::SimdCpu;
+
 use crate::cpu::QuotedPrintableCpu;
 
 /// The backend, the mode and the line ending of encoded output.
 ///
 /// A plain value holding no state: an application builds one and uses it
 /// for every call, its one-shot methods as the encoders and decoders built
-/// from it. Defaults to the build's baseline backend, text with CRLF.
+/// from it. Defaults to text with CRLF on the backend of the token the
+/// application installed, read when the value is built; an explicit token
+/// goes in [`cpu`](Self::cpu): `QuotedPrintableCodec { cpu:
+/// QuotedPrintableCpu::new(token), ..QuotedPrintableCodec::default() }`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct QuotedPrintableCodec {
     /// The backend every call runs.
@@ -23,6 +28,16 @@ pub struct QuotedPrintableCodec {
     /// What the bytes are: the text or binary content of a MIME body, or the
     /// text of RFC 2047 encoded words.
     pub mode: QuotedPrintableMode,
+}
+
+impl QuotedPrintableCodec {
+    /// The build target's backend, whatever the application installed, text
+    /// with CRLF.
+    pub const BASELINE: Self = Self {
+        cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
+        eol: QuotedPrintableEol::Crlf,
+        mode: QuotedPrintableMode::Text,
+    };
 }
 
 /// What a codec encodes and decodes.

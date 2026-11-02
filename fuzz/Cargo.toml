@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 quoted-printable-codec = { path = ".." }
-simd-cpu = { version = "0.0.1", git = "https://github.com/pimalaya/simd-cpu", rev = "4cde2e904ec6edd841215dd5111213325899e11a", features = ["std"] }
+simd-cpu = { version = "0.0.1", git = "https://github.com/pimalaya/simd-cpu", rev = "f77308a7279f2ad9feabd2581e58487e040d86a7", features = ["std"] }
 
 [[bin]]
 name = "decode"

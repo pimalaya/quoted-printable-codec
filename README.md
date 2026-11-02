@@ -17,14 +17,14 @@ Quoted-printable encoder and decoder with SIMD and no_std
 
 ## Features
 
-- **SIMD**: AVX-512 and AVX2 on x86_64, NEON on aarch64, the backend picked once by the application with a CPU token; safe portable code anywhere else.
+- **SIMD**: AVX-512 and AVX2 on x86_64, NEON on aarch64, the backend picked from the CPU token the application installs once, or one a caller passes; safe portable code anywhere else, and when nothing is installed on x86_64.
 - **Fast**: up to 44x faster than encodify and 63x faster than the quoted_printable crate, see the [benchmarks](#benchmarks).
 - **MIME lines**: encodes in lines of at most 76 characters, soft breaks included, ended by CRLF or LF.
 - **Text and binary**: text mode keeps line breaks as hard breaks, binary mode escapes CR and LF like any other byte.
 - **Header words**: Q mode writes and reads the RFC 2047 Q encoding of encoded words, with an exact `encoded_len` to size them.
 - **Lenient decoding**: never fails, follows the robust rules of RFC 2045 (lowercase digits, trailing blanks, bare CRs, malformed escapes kept), and reports whether the input was clean.
 - **I/O-free**: encode and decode chunk by chunk into your own buffers.
-- **Portable**: no_std, the CPU features detected once by the application through [simd-cpu](https://github.com/pimalaya/simd-cpu), the only dependency; unsafe code only in the SIMD backends, which Miri and fuzz targets check against the portable one, vectorized by the compiler for any target.
+- **Portable**: no_std, the CPU features detected and installed once by the application through [simd-cpu](https://github.com/pimalaya/simd-cpu), the only dependency, and taken by every default codec; unsafe code only in the SIMD backends, which Miri and fuzz targets check against the portable one, vectorized by the compiler for any target.
 
 ## RFC coverage
 

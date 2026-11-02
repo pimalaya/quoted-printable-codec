@@ -5,13 +5,19 @@
 //! it, with SIMD, `no_std` and no I/O.
 //!
 //! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
-//! a [`QuotedPrintableCpu`] backend token, picked from the `simd_cpu::SimdCpu`
-//! the application gets once, usually from `SimdCpu::detect`, the mode, body
-//! text, body binary or Q, and the line ending of encoded output. Its one-shot methods
-//! take a whole input at once. [`QuotedPrintableEncode`] and
+//! a [`QuotedPrintableCpu`] backend token, the mode, body text, body binary
+//! or Q, and the line ending of encoded output. Its one-shot methods take a
+//! whole input at once. [`QuotedPrintableEncode`] and
 //! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
 //! then the caller's input and output buffers chunk by chunk, as any I/O-free
 //! coroutine does.
+//!
+//! The backend comes from a `simd_cpu::SimdCpu`. The application installs
+//! one once, first thing in `main`, with `SimdCpu::install_detected`, and
+//! every `QuotedPrintableCodec::default()` built afterwards runs it, the
+//! build target's baseline when none is installed; a caller holding a token
+//! of its own builds the backend with `QuotedPrintableCpu::new`. The library
+//! never detects or installs.
 //!
 //! The portable backend reads blocks of 32 bytes in safe code the compiler
 //! vectorizes on any target: a block takes a bitmask of its special bytes
@@ -27,17 +33,15 @@
 //! for, between two calls.
 //!
 //! ```
-//! use quoted_printable_codec::{
-//!     codec::{QuotedPrintableCodec, QuotedPrintableEol, QuotedPrintableMode},
-//!     cpu::QuotedPrintableCpu,
+//! use quoted_printable_codec::codec::{
+//!     QuotedPrintableCodec, QuotedPrintableEol, QuotedPrintableMode,
 //! };
-//! use simd_cpu::SimdCpu;
 //!
 //! let input = "Grüße,\nJürgen\n".as_bytes();
 //! let codec = QuotedPrintableCodec {
-//!     cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
 //!     eol: QuotedPrintableEol::Crlf,
 //!     mode: QuotedPrintableMode::Text,
+//!     ..QuotedPrintableCodec::default()
 //! };
 //!
 //! let mut encoded = [0; 256];
