@@ -1,22 +1,17 @@
 //! # Encoding
 //!
 //! Quoted-printable encoding of a MIME body, in lines of at most 76
-//! characters soft break included (RFC 2045 6.7).
+//! characters (RFC 2045 6.7).
 //!
-//! In text mode, LF and CRLF become hard line breaks; in binary mode, CR and
-//! LF are escaped like any other byte and the output has soft line breaks
-//! only. `=`, bytes from 0x7F up, control characters other than TAB, a bare
-//! CR in text mode and a space or tab that would end a line are escaped as
-//! `=XX`, uppercase; an escape is never split across lines. In Q mode, the
-//! RFC 2047 encoding of header words, letters, digits and `!*+-/` stay
-//! literal, a space becomes `_`, every other byte is escaped, and no line
-//! breaks at all: the caller splits the text into encoded words, which
-//! [`QuotedPrintableCodec::encoded_len`] sizes exactly.
+//! Text mode writes LF and CRLF as hard line breaks; binary mode escapes CR
+//! and LF. Both escape `=`, bytes from 0x7F, controls but TAB, a bare CR in
+//! text mode and a line-ending blank, as uppercase `=XX`, never split across
+//! lines. Q mode (RFC 2047) keeps letters, digits and `!*+-/`, writes a space
+//! as `_`, escapes the rest and breaks no line: the caller splits the words,
+//! sized by [`QuotedPrintableCodec::encoded_len`].
 //!
-//! [`QuotedPrintableEncode`] takes the input chunk by chunk; the one-shot
-//! [`QuotedPrintableCodec::encode`] and `QuotedPrintableCodec::encode_vec`
-//! encode a whole input. Decoding is the sibling module
-//! [`decode`](crate::decode).
+//! [`QuotedPrintableEncode`] takes the input chunk by chunk;
+//! [`QuotedPrintableCodec::encode`] takes it whole.
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -34,15 +29,13 @@ use crate::{
 /// The most characters a line holds before its soft break `=`.
 pub(crate) const LINE: usize = 75;
 
-/// The output bytes a block may touch: a portable block commits at most 32
-/// escapes and two soft breaks, under 128 bytes, and copies a run whole past
-/// them; an AVX-512 chunk writes three groups of at most 66 bytes, and up to
-/// 68 bytes past the start of each; an AVX2 or NEON group writes at most 51
-/// bytes, and up to 99 past its start.
+/// The output bytes a block may touch. A portable block commits under 128
+/// and copies a run whole past them. An AVX-512 chunk writes three groups of
+/// 66 at most, storing up to 68 past each start. An AVX2 or NEON group writes
+/// 51 at most, storing up to 99 past its start.
 pub(crate) const ROOM: usize = 200;
 
-/// Runs the SIMD encoder `$kernel`, built for the mode and the line ending of
-/// `$codec`.
+/// Runs the SIMD encoder `$kernel` for the mode and line ending of `$codec`.
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_feature = "neon")
@@ -62,12 +55,10 @@ macro_rules! kernel {
     }};
 }
 
-/// I/O-free quoted-printable encoder, resumed with the caller's input and
-/// output buffers.
+/// I/O-free quoted-printable encoder, resumed with the caller's buffers.
 ///
-/// The input can be cut anywhere: the encoder carries a trailing space or
-/// tab, and a trailing CR in text mode, until the next byte tells whether a
-/// line ends there.
+/// The input can be cut anywhere: a trailing blank, or CR in text mode, is
+/// carried until the next byte tells whether a line ends there.
 ///
 /// ```
 /// use quoted_printable_codec::{codec::QuotedPrintableCodec, encode::QuotedPrintableEncode};
@@ -88,13 +79,11 @@ macro_rules! kernel {
 pub struct QuotedPrintableEncode {
     codec: QuotedPrintableCodec,
     column: usize,
-    // NOTE: carries a block, queues what a block touches.
     edge: Edge<32, ROOM>,
 }
 
 impl QuotedPrintableEncode {
-    /// Builds an encoder running the backend, the mode and the line ending of
-    /// `codec`.
+    /// Builds an encoder running `codec`.
     pub fn new(codec: QuotedPrintableCodec) -> Self {
         Self {
             codec,
@@ -105,9 +94,8 @@ impl QuotedPrintableEncode {
 
     /// Encodes as much of `src` as fits in `dst`.
     ///
-    /// The caller drains `dst` and resumes with the rest of `src` or the
-    /// next chunk; one byte of room always lets the encoder progress. The
-    /// bytes of `dst` past the ones written may be overwritten.
+    /// The caller drains `dst` and resumes with the rest; one byte of room
+    /// always progresses. Bytes past the written ones may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableEncodeOutput {
         let (codec, column) = (self.codec, &mut self.column);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
@@ -117,11 +105,10 @@ impl QuotedPrintableEncode {
         QuotedPrintableEncodeOutput { read, written }
     }
 
-    /// Ends the input: writes what is still queued and the carried space,
-    /// tab or CR, escaped as the end of the input asks.
+    /// Ends the input: writes the queue and the carried blank or CR.
     ///
-    /// Returns the bytes written, the encoder starting over for another
-    /// input, or none, writing nothing, when `dst` is too short.
+    /// Returns the bytes written and resets the encoder, or none, writing
+    /// nothing, when `dst` is too short.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<usize> {
         let mut column = self.column;
         let written = self.edge.finish(dst, |src, dst| {
@@ -146,8 +133,8 @@ impl QuotedPrintableCodec {
     /// Encodes the whole of `src` into `dst`, returning the bytes written.
     ///
     /// Returns none, writing nothing, when `dst` is shorter than
-    /// [`encoded_len_max`](Self::encoded_len_max) asks. Within that length,
-    /// the bytes of `dst` past the ones written may be overwritten.
+    /// [`encoded_len_max`](Self::encoded_len_max). Bytes past the written
+    /// ones may be overwritten.
     #[inline]
     pub fn encode(self, src: &[u8], dst: &mut [u8]) -> Option<usize> {
         let dst = dst.get_mut(..self.encoded_len_max(src.len())?)?;
@@ -166,19 +153,18 @@ impl QuotedPrintableCodec {
         out.truncate(start + written);
     }
 
-    /// The room [`encode`](Self::encode) needs for an input of `len` bytes,
-    /// whatever they hold, or none when that overflows `usize`.
+    /// The room [`encode`](Self::encode) needs for any `len` input bytes, or
+    /// none on `usize` overflow.
     ///
-    /// Every byte takes at most three characters, and a soft break follows
-    /// at least 73 characters, so at least 25 input bytes; past them, the
-    /// room a block writes ahead of what it commits.
+    /// Three characters a byte, one soft break per 25 bytes at most, and the
+    /// room a block writes ahead.
     pub fn encoded_len_max(self, len: usize) -> Option<usize> {
         let breaks = (len / 25 + 1).checked_mul(self.eol.soft_break().1)?;
         len.checked_mul(3)?.checked_add(breaks + ROOM)
     }
 
-    /// The exact number of bytes [`encode`](Self::encode) writes for `src`:
-    /// counted in Q mode, encoded into a scratch buffer in the others.
+    /// The exact length [`encode`](Self::encode) writes for `src`: counted in
+    /// Q mode, encoded into scratch otherwise.
     pub fn encoded_len(self, src: &[u8]) -> usize {
         if self.mode == QuotedPrintableMode::Q {
             let width = |&byte: &u8| {
@@ -192,8 +178,7 @@ impl QuotedPrintableCodec {
         }
 
         let mut encoder = QuotedPrintableEncode::new(self);
-        // NOTE: what `finish` writes, its queue and the carry it encodes, fits
-        // in twice `ROOM`.
+        // NOTE: `finish` writes twice `ROOM` at most.
         let mut scratch = [0; 2 * ROOM];
         let mut src = src;
         let mut len = 0;
@@ -208,12 +193,11 @@ impl QuotedPrintableCodec {
     }
 }
 
-/// Encodes `src` into `dst` from `column`, as much as fits, with the blocks of
-/// the codec's backend, returning the bytes read and written, and none held,
-/// as [`Edge`] asks.
+/// Encodes as much of `src` as fits in `dst` from `column` with the codec's
+/// backend, returning the bytes read, written and held (none), as [`Edge`]
+/// asks.
 ///
-/// Unless `last` tells that the input ends with `src`, a space, tab or CR
-/// that may end a line is left unread when `src` ends before telling.
+/// Unless `last`, a trailing blank or CR is left unread.
 fn blocks(
     src: &[u8],
     dst: &mut [u8],
@@ -224,20 +208,17 @@ fn blocks(
     match (codec.mode, codec.cpu.backend()) {
         (QuotedPrintableMode::Q, _) => words(src, dst),
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: the codec's token names the AVX-512 backend, which the CPU
-        // supports.
+        // SAFETY: the token names a backend the CPU supports.
         (_, crate::cpu::QuotedPrintableBackend::Avx512) if unsafe { avx512::dense(src) } => unsafe {
             kernel!(avx512::encode, codec, src, dst, last, column)
         },
         #[cfg(target_arch = "x86_64")]
-        // SAFETY: the codec's token names the AVX2 backend, which the CPU
-        // supports.
+        // SAFETY: the token names a backend the CPU supports.
         (_, crate::cpu::QuotedPrintableBackend::Avx2) => unsafe {
             kernel!(avx2::encode, codec, src, dst, last, column)
         },
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        // SAFETY: the codec's token names the NEON backend, which the CPU
-        // supports.
+        // SAFETY: the token names a backend the CPU supports.
         (_, crate::cpu::QuotedPrintableBackend::Neon) => unsafe {
             kernel!(neon::encode, codec, src, dst, last, column)
         },
@@ -246,8 +227,8 @@ fn blocks(
     }
 }
 
-/// Encodes `src` into `dst` in the Q encoding, as much as fits, returning the
-/// bytes read and written, and none held: every byte is a token of its own.
+/// Encodes as much of `src` as fits in `dst` in Q mode, returning the bytes
+/// read, written and held (none: each byte is its own token).
 fn words(src: &[u8], dst: &mut [u8]) -> [usize; 3] {
     let mut written = 0;
 
@@ -269,20 +250,19 @@ fn words(src: &[u8], dst: &mut [u8]) -> [usize; 3] {
     [src.len(), written, 0]
 }
 
-/// The bytes the Q encoding writes literally: letters, digits and `!*+-/`,
-/// the ones RFC 2047 5(3) allows in a phrase, so that a word goes anywhere.
+/// Bytes Q writes literally: letters, digits and `!*+-/`, the set RFC 2047
+/// 5(3) allows in a phrase, so words fit anywhere.
 const fn is_phrase(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'!' | b'*' | b'+' | b'-' | b'/')
 }
 
-/// The soft break a group of the AVX2 or NEON encoder needs, if any, and the
-/// column after the group, from the bytes it escapes, the line feeds it
-/// breaks on and the CRs it drops, a bit each, the length of its output and
-/// the column before it; `crlf` tells that its line breaks are CRLF.
+/// The soft break an AVX2 or NEON group needs, if any, and the column after
+/// it.
 ///
-/// The literal or escape covering the line's first character past its room
-/// takes the break before it, unless a line break comes first. A group has
-/// at most 16 bytes, so its output fits in a line after one break.
+/// Takes the group's escape, line feed and dropped CR masks, its output
+/// length and the column before it. The break goes before the unit crossing
+/// the line's room, unless a line break comes first. A group holds 16 bytes
+/// at most, so one break suffices.
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_feature = "neon")
@@ -293,9 +273,6 @@ pub(crate) fn line(
     col: usize,
     crlf: bool,
 ) -> (Option<usize>, usize) {
-    // NOTE: the output offset of byte `i`: a character for each byte before
-    // it, two more for each escape, one more for each CRLF line break, none
-    // for each CR dropped.
     let at = |i: u32| {
         let count = |mask: u32| (mask & !(u32::MAX << i)).count_ones() as usize;
         i as usize + 2 * count(esc) + crlf as usize * count(lf) - count(drop)
@@ -315,9 +292,8 @@ pub(crate) fn line(
     (cut, col)
 }
 
-/// The portable loop of [`blocks`], in blocks of 32 bytes reading the 2 bytes
-/// after them ahead, built apart for each mode, `TEXT` reading line breaks: a
-/// mode tested for each byte costs a fifth of binary encoding.
+/// The portable loop of [`blocks`]: 32-byte blocks reading 2 bytes ahead,
+/// built per mode, as a per-byte mode test costs a fifth of binary encoding.
 fn walk<const TEXT: bool>(
     src: &[u8],
     dst: &mut [u8],
@@ -325,10 +301,10 @@ fn walk<const TEXT: bool>(
     codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    // NOTE: a local, as the closure below compiles worse reading `TEXT`.
+    // NOTE: a local, as the closure compiles worse reading `TEXT`.
     let text = TEXT;
     let (soft, soft_len) = codec.eol.soft_break();
-    // NOTE: padded first, so that its stores are done when blocks load them.
+    // NOTE: padded first, so its stores land before blocks load them.
     let mut end = [0; 128];
     pad(&mut end, src);
 
@@ -365,9 +341,8 @@ fn walk<const TEXT: bool>(
         }
 
         let mut from = 0;
-        // NOTE: input byte `i` goes to output offset `i + off - 128`, and the
-        // line is full at output offset `lim - 128`: biased, both stay
-        // positive when CRs are dropped, and the bias vanishes under `& 127`.
+        // NOTE: offsets are biased by 128 to stay positive when CRs are
+        // dropped. The bias vanishes under `& 127`.
         let mut off = 128;
         let mut lim = 128 + LINE - col;
 

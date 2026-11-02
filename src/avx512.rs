@@ -1,13 +1,10 @@
 //! # AVX-512 backend
 //!
-//! Blocks of 64 bytes with the VBMI2 byte compress, no branch on the data,
-//! each block read ahead while the one before is finished. Decoding reads
-//! every escape of a block at once, from the block loaded again one and two
-//! bytes on, and compresses the digits and soft breaks away. Encoding builds
-//! the bytes each byte of a chunk may take once, spreads each group of 21
-//! over the three lanes of its escape, compresses away the lanes it does not
-//! use, and finds the one soft break a group may need from masks moved to
-//! the output by `pext`.
+//! Branch-free 64-byte blocks with the VBMI2 byte compress, the next block
+//! read ahead. Decoding reads a block's escapes at once from loads at offsets
+//! 0, 1 and 2, and compresses digits and soft breaks away. Encoding spreads
+//! each group of 21 bytes over three lanes a byte, compresses unused lanes
+//! away, and places the soft break from masks moved by `pext`.
 
 use core::{arch::x86_64::*, hint::select_unpredictable};
 
@@ -17,10 +14,9 @@ use crate::{
     is_blank,
 };
 
-/// For the low 6 bits of each hex digit: the digit, its value shifted high
-/// and its value, elsewhere a byte with other low bits; then, for each of the
-/// three groups of an encoding chunk, the byte each lane takes, three lanes a
-/// byte; and the hex digit of each low nibble.
+/// For decoding, by low 6 bits: each hex digit (a mismatch elsewhere), its
+/// value shifted high and its value. For encoding: the byte each lane of the
+/// three groups takes, and the hex digit of each nibble.
 static TABLES: [[u8; 64]; 7] = {
     let mut table = [[0; 64]; 7];
     let mut i = 0;
@@ -44,9 +40,8 @@ static TABLES: [[u8; 64]; 7] = {
 /// The first of the three lanes each byte of a group spreads over.
 const STARTS: u64 = 0x1249_2492_4924_9249;
 
-/// Decodes `src` into `dst`, at least as long, up to the first byte the
-/// token steps decide or the end of `src`, as the portable blocks do;
-/// `prev` tells whether a space or tab comes before `src`.
+/// Decodes like the portable blocks; `prev` tells whether a blank precedes
+/// `src`.
 #[target_feature(enable = "avx512vbmi2,avx512vbmi,bmi1,bmi2,lzcnt,popcnt")]
 pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
     let [check, high, low, ..] = TABLES.map(|table| load(&table));
@@ -54,15 +49,10 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
     let mut written = 0;
     let mut bad = 0;
 
-    // The block from `read`, its escapes decoded, and its masks: the digits
-    // and soft breaks, `carry` the lanes the last block's run over, the bytes
-    // the token steps decide, `prev` telling whether a blank comes before,
-    // the bytes that are not clean, and what the next block takes over.
     let scan = |read: usize, carry: u64, prev: u64| {
         let rest = src.len() - read;
         let at = src.as_ptr().wrapping_add(read);
-        // SAFETY: 66 bytes are left from `at`, or the masks cover the bytes
-        // left only.
+        // SAFETY: 66 bytes are left from `at`, or the masks cover the rest.
         let [a, b, c] = [0, 1, 2].map(|i| unsafe {
             match rest >= 66 {
                 true => _mm512_loadu_si512(at.add(i).cast()),
@@ -95,8 +85,7 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
         (out, [gone, slow, lower | !(text | tab | cr | lf)], next)
     };
 
-    // NOTE: the next block is scanned ahead, while this one is cut where it
-    // stops.
+    // NOTE: the next block is scanned ahead, so that blocks overlap.
     let mut next = (read < src.len()).then(|| scan(read, 0, prev as u64));
 
     while let Some((out, [gone, slow, flags], [carry, prev])) = next {
@@ -125,8 +114,7 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
     [read, written]
 }
 
-/// Encodes `src` into `dst` from `column` in chunks of three groups of 21
-/// bytes, as many as fit, as the portable walk does.
+/// Encodes like the portable walk, in chunks of three groups of 21 bytes.
 #[target_feature(enable = "avx512vbmi2,avx512vbmi,bmi1,bmi2,lzcnt,popcnt")]
 pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     src: &[u8],
@@ -138,16 +126,12 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     let (soft, soft_len) = eol.soft_break();
     let crlf = TEXT && CRLF;
     let base = dst.as_mut_ptr();
-    // NOTE: loaded opaque, as LLVM would fuse the three spreads of a group
-    // into two two-table permutes, slower on Zen 5.
+    // NOTE: opaque, or LLVM fuses the spreads into `vpermt2b`, measured slower.
     let [_, _, _, spreads @ .., hex] = core::hint::black_box(&TABLES).each_ref().map(|t| load(t));
     let mut read = 0;
     let mut written = 0;
     let mut col = *column;
 
-    // The first, second and third byte each byte of `a` takes, and the bytes
-    // to escape, the line feeds and the CRs they drop; `b` holds the bytes one
-    // on, `end` the input's last byte.
     let bytes = |a, b, end: u64| {
         let is = |v, byte| _mm512_cmpeq_epi8_mask(v, splat(byte));
         let blank = is(a, b' ') | is(a, b'\t');
@@ -167,9 +151,6 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         ([lead, set(high, lf, b'\n'), low], [esc, lf, drop])
     };
 
-    // Encodes the first `n` bytes of the masks `masks`, which the lanes of
-    // `spread` take from `bytes`, at `at` in `dst`, returning the bytes
-    // written.
     let mut group = |[lead, high, low]: [__m512i; 3], spread, masks: [u64; 3], n: usize, at| {
         let [escs, lfs, drops] = masks.map(|mask| _pdep_u64(mask, STARTS));
         let starts = _bzhi_u64(STARTS, 3 * n as u32) & !drops;
@@ -180,8 +161,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let out = _mm512_maskz_compress_epi8(keep, out);
         let len = keep.count_ones() as usize;
 
-        // NOTE: the literal or escape covering the line's first lane past its
-        // room takes a soft break before it, unless a line break comes first.
+        // NOTE: a soft break goes before the first unit past the line's room.
         let [starts, lfs] = [starts, lfs].map(|mask| _pext_u64(mask, keep));
         let room = LINE - col;
         let upto = _bzhi_u64(!0, room as u32 + 1);
@@ -203,13 +183,11 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         len + select_unpredictable(need, soft_len, 0)
     };
 
-    // NOTE: the next chunk is read ahead, while the column runs through the
-    // groups of this one.
+    // NOTE: the next chunk is read ahead, so that chunks overlap.
     let full = |read: usize| src.len() - read >= 65 - last as usize;
     let chunk = |read: usize| {
         let at = src.as_ptr().wrapping_add(read);
-        // SAFETY: 64 bytes are left from `read`, and the mask covers the bytes
-        // left from `read + 1` only.
+        // SAFETY: 64 bytes are left from `read`, and the mask covers the rest.
         let [a, b] = unsafe {
             let b = _mm512_maskz_loadu_epi8(first(src.len() - read - 1), at.add(1).cast());
             [_mm512_loadu_si512(at.cast()), b]
@@ -229,8 +207,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         read += 63;
     }
 
-    // NOTE: the input's end; unless `last`, a space, tab or CR ending `src`
-    // waits for the next byte.
+    // NOTE: unless `last`, a trailing blank or CR waits for the next byte.
     let rest = src.len() - read;
     let mut len = rest;
 
@@ -264,8 +241,8 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     [read, written, 0]
 }
 
-/// Whether `src` is long or has more than a few bytes to escape: on a short
-/// input with so few, the portable walk over them beats spreading them all.
+/// Whether `src` is long or has more than 4 bytes to escape: below that, the
+/// portable walk wins.
 #[target_feature(enable = "avx512bw,bmi2,popcnt")]
 pub(crate) fn dense(src: &[u8]) -> bool {
     // SAFETY: the mask covers `src` only.
@@ -273,8 +250,7 @@ pub(crate) fn dense(src: &[u8]) -> bool {
     src.len() > 64 || (!plain(a) & first(src.len())).count_ones() > 4
 }
 
-/// The lanes of `a` both directions copy as they are, as [`crate::is_plain`]
-/// tells.
+/// The lanes of `a` copied as they are, as [`crate::is_plain`] tells.
 #[target_feature(enable = "avx512bw")]
 fn plain(a: __m512i) -> u64 {
     let is = |byte| _mm512_cmpeq_epi8_mask(a, splat(byte));

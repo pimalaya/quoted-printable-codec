@@ -1,12 +1,11 @@
 //! # Call edges
 //!
-//! What a coroutine keeps between two calls: the input bytes it could not
-//! decide yet, and the output the caller's buffer had no room for. Both
-//! coroutines run their core straight from the caller's input into the
-//! caller's output, and fall back on the [`Edge`] only around those bytes.
+//! What a coroutine keeps between calls: undecided input and output waiting
+//! for room. Cores run straight from the caller's input to its output, and
+//! fall back on the [`Edge`] only around those bytes.
 
-/// The input bytes a core leaves undecided and the output waiting for room,
-/// `C` and `Q` sized by each coroutine for its longest undecided token.
+/// Undecided input and output waiting for room, `C` and `Q` sized for each
+/// coroutine's longest undecided token.
 #[derive(Clone, Debug)]
 pub(crate) struct Edge<const C: usize, const Q: usize> {
     carry: [u8; C],
@@ -32,13 +31,12 @@ impl<const C: usize, const Q: usize> Edge<C, Q> {
     /// Runs `core` over `src` into `dst`, returning the bytes read and
     /// written.
     ///
-    /// `core` takes the input, the output and whether the input ends there,
-    /// and returns the bytes it read and wrote and the bytes it held: output
-    /// bytes it wrote after the ones it counts, which go back to the input
-    /// ahead of the unread rest. Unless the input ends, it reads no token it
-    /// cannot decide yet. When `core` stops short, the edge carries what is
-    /// left with the next input bytes and runs `core` over them into its
-    /// queue, so that one byte of room always progresses.
+    /// `core` takes the input, the output and whether the input ends, and
+    /// returns the bytes read, written and held. Held bytes sit past the
+    /// written ones and go back ahead of the unread input. Unless the input
+    /// ends, `core` reads no undecided token. When it stops short, the edge
+    /// runs it over the carried bytes into the queue, so one byte of room
+    /// always progresses.
     pub(crate) fn resume(
         &mut self,
         src: &[u8],
@@ -84,11 +82,11 @@ impl<const C: usize, const Q: usize> Edge<C, Q> {
         }
     }
 
-    /// Ends the input: runs `core` over the carried bytes, and writes what
-    /// is queued and what `core` gives.
+    /// Ends the input: runs `core` over the carried bytes, then writes the
+    /// queue and `core`'s output.
     ///
-    /// Returns the bytes written, or none, changing nothing, when `dst` is
-    /// too short: the caller keeps what `core` changed only on success.
+    /// Returns the bytes written, or none when `dst` is too short, changing
+    /// nothing: the caller keeps `core`'s changes only on success.
     pub(crate) fn finish(
         &mut self,
         dst: &mut [u8],

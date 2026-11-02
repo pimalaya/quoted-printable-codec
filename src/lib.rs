@@ -1,36 +1,23 @@
 //! # quoted-printable-codec
 //!
-//! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7) and
-//! of the Q encoding of header words (RFC 2047 4.2), lenient as mail needs
-//! it, with SIMD, `no_std` and no I/O.
+//! Lenient quoted-printable codec for MIME bodies (RFC 2045 6.7) and the Q
+//! encoding of header words (RFC 2047 4.2), with SIMD, `no_std` and no I/O.
 //!
-//! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
-//! a [`QuotedPrintableCpu`] backend token, the mode, body text, body binary
-//! or Q, and the line ending of encoded output. Its one-shot methods take a
-//! whole input at once. [`QuotedPrintableEncode`] and
-//! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
-//! then the caller's input and output buffers chunk by chunk, as any I/O-free
-//! coroutine does.
+//! A [`QuotedPrintableCodec`], from [`codec`], holds the backend, the mode
+//! and the line ending; its one-shot methods take a whole input.
+//! [`QuotedPrintableEncode`] and [`QuotedPrintableDecode`], from [`encode`]
+//! and [`decode`], are I/O-free coroutines taking the input chunk by chunk.
 //!
-//! The backend comes from a `simd_cpu::SimdCpu`. The application installs
-//! one once, first thing in `main`, with `SimdCpu::install_detected`, and
-//! every `QuotedPrintableCodec::default()` built afterwards runs it, the
-//! build target's baseline when none is installed; a caller holding a token
-//! of its own builds the backend with `QuotedPrintableCpu::new`. The library
-//! never detects or installs.
+//! The backend comes from the `simd_cpu::SimdCpu` token the application
+//! installs with `SimdCpu::install_detected`, or the build target's baseline.
+//! A caller with its own token uses `QuotedPrintableCpu::new`. The library
+//! never detects CPU features.
 //!
-//! The portable backend reads blocks of 32 bytes in safe code the compiler
-//! vectorizes on any target: a block takes a bitmask of its special bytes
-//! and walks its set bits only, each literal run between them copied whole.
-//! The AVX-512 backend reads blocks of 64 bytes with no branch on the data:
-//! decoding reads every escape of a block at once and compresses the rest
-//! away, encoding spreads each byte over the three lanes of its escape and
-//! compresses the unused ones away. The AVX2 and NEON backends take the same
-//! steps on blocks of 32 and 16 bytes, compressing through tables of byte
-//! shuffles. Every backend leaves to token steps what a block does not decide
-//! alone, such as a malformed escape or blanks before a line break, and the
-//! coroutines keep only the few bytes they cannot decide yet, or have no room
-//! for, between two calls.
+//! The portable backend walks the special bytes of 32-byte blocks, in safe
+//! code the compiler vectorizes. The AVX-512, AVX2 and NEON backends work
+//! branch-free on blocks of 64, 32 and 16 bytes, compressing unused bytes
+//! away. Token steps handle what a block cannot decide alone, such as a
+//! malformed escape or blanks before a line break.
 //!
 //! ```
 //! use quoted_printable_codec::codec::{
@@ -88,8 +75,7 @@ pub mod encode;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod neon;
 
-/// The bytes both directions copy as they are: printable ASCII but `=`,
-/// space and tab.
+/// Bytes copied as they are: space to `~` except `=`, and tab.
 const fn is_plain(byte: u8) -> bool {
     (byte.wrapping_sub(b' ') < 0x5f) & (byte != b'=') | (byte == b'\t')
 }
@@ -98,8 +84,7 @@ const fn is_blank(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
-/// The lanes of `bytes` in `class`, a bit each, in a shape compilers turn
-/// into vector compares.
+/// A bit for each lane of `bytes` in `class`, shaped for vector compares.
 #[inline(never)]
 fn mask(bytes: &[u8; 64], class: impl Fn(u8) -> bool) -> u32 {
     let (halves, _) = bytes.as_chunks();
@@ -113,9 +98,8 @@ fn half(bytes: &[u8; 16], class: &impl Fn(u8) -> bool) -> u32 {
     lanes.fold(0, |mask, (i, &byte)| mask | (class(byte) as u32) << i)
 }
 
-/// Copies the last 64 bytes of `src`, or all of them when fewer, to end at
-/// offset 64 of `out`, zeros after them, for blocks to read the end of an
-/// input 64 bytes at a time.
+/// Copies the last 64 bytes of `src` (or fewer) to end at offset 64 of `out`,
+/// zeros after, so blocks can read the input's end 64 bytes at a time.
 fn pad(out: &mut [u8; 128], src: &[u8]) {
     match src.last_chunk::<64>() {
         Some(last) => out[..64].copy_from_slice(last),
@@ -123,16 +107,14 @@ fn pad(out: &mut [u8; 128], src: &[u8]) {
     }
 }
 
-/// The 64 bytes a block at the start of `src` reads, from `end` as [`pad`]
-/// fills it when fewer remain.
+/// The first 64 bytes of `src`, taken from `end` (see [`pad`]) when fewer.
 fn window<'a>(src: &'a [u8], end: &'a [u8; 128]) -> &'a [u8; 64] {
     src.first_chunk()
         .unwrap_or_else(|| end[64 - src.len()..].first_chunk().unwrap())
 }
 
-/// For each mask of 8 lanes, the lanes it holds in order, then 0x80: the byte
-/// shuffle moving them to the front, as the AVX2 and NEON backends compress
-/// bytes.
+/// For each 8-lane mask, its lanes in order then 0x80: the byte shuffle the
+/// AVX2 and NEON backends compress with.
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_feature = "neon")

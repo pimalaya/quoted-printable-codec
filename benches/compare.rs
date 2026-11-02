@@ -152,8 +152,6 @@ fn decodes(c: &mut Criterion) {
             let mut out = vec![0; codec.decoded_len_max(src.len()) + 64];
             group.throughput(Throughput::Bytes(size as u64));
 
-            // NOTE: every decoder gives back the raw bytes, so they all do
-            // the same work.
             let written = codec.decode(&src, &mut out).unwrap().written;
             assert_eq!(out[..written], raw);
             let written = encodify::qp::BODY.decode_slice(&src, &mut out).unwrap();

@@ -1,16 +1,9 @@
 //! # NEON backend
 //!
-//! The steps of the AVX-512 backend on vectors of 16 bytes, for aarch64. `tbl`
-//! compresses bytes 8 lanes at a time from a table of shuffles, and the mask
-//! of a vector's lanes is the sum of their bits, each weighted by its lane.
-//! Decoding reads every escape of a block of 16 bytes at once, from the block
-//! loaded again one and two bytes on, and compresses the digits and soft
-//! breaks away. Encoding takes chunks of 32 bytes, as many as the encoder
-//! carries, in two groups of 16: it builds the bytes each byte may take,
-//! spreads them over the three lanes of its escape with a three-table `tbl`
-//! per vector, compresses away the lanes it does not use, marked by their high
-//! bit, and places the one soft break a group may need at offsets counted from
-//! the masks of its bytes.
+//! The AVX-512 steps on 16-byte vectors, for aarch64. `tbl` compresses 8
+//! lanes at a time from a shuffle table, and a mask sums lane-weighted bits.
+//! Encoding spreads bytes with a three-table `tbl`, marks unused lanes by
+//! their high bit and places the soft break with [`line()`].
 
 use core::arch::aarch64::*;
 
@@ -21,9 +14,8 @@ use crate::{
     is_blank,
 };
 
-/// For each of the three vectors a group of 16 bytes spreads over, the lane
-/// it takes from the first, the second and the third byte each byte takes,
-/// three tables of 16 lanes one after the other, three lanes a byte.
+/// The lanes each of a group's three vectors takes from the three bytes each
+/// input byte becomes, as indices into three 16-lane tables.
 static SPREADS: [[u8; 16]; 3] = {
     let mut table = [[0; 16]; 3];
     let mut lane = 0;
@@ -43,19 +35,15 @@ static LAST: [u8; 31] = {
     table
 };
 
-/// Decodes `src` into `dst`, at least as long, up to the first byte the
-/// token steps decide or the end of `src`, as the portable blocks do;
-/// `prev` tells whether a space or tab comes before `src`.
+/// Decodes like the portable blocks; `prev` tells whether a blank precedes
+/// `src`.
 #[target_feature(enable = "neon")]
 pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
     let mut read = 0;
     let mut written = 0;
     let mut bad = 0;
-    // NOTE: the lanes the last block's escape or soft break runs over, and
-    // whether a blank ends it.
     let [mut carry, mut prev] = [0, prev as u32];
 
-    // Whether each lane of `v` is a hex digit, either case, and its value.
     let digit = |v| {
         let letter = within(vorrq_u8(v, vdupq_n_u8(0x20)), b'a', b'f');
         let digit = vorrq_u8(within(v, b'0', b'9'), letter);
@@ -87,8 +75,6 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
         let done = valid & first(stop);
         bad |= (lower | !(text | tab | cr | lf)) & done;
 
-        // NOTE: compressed straight into `dst` when it has 16 bytes left, so
-        // that no write passes its end.
         let mut spare = [0; 16];
         let direct = dst.len() - written >= 16;
         let to = match direct {
@@ -117,8 +103,7 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
     [read, written]
 }
 
-/// Encodes `src` into `dst` from `column` in chunks of two groups of 16
-/// bytes, as many as fit, as the portable walk does.
+/// Encodes like the portable walk, in chunks of two groups of 16 bytes.
 #[target_feature(enable = "neon")]
 pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     src: &[u8],
@@ -141,15 +126,13 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let rest = src.len() - read;
         let mut len = rest;
 
-        // NOTE: unless `last`, a space, tab or CR ending `src` waits for the
-        // next byte.
+        // NOTE: unless `last`, a trailing blank or CR waits for the next byte.
         if !last {
             len -= (TEXT && src[read..].ends_with(b"\r")) as usize;
             len -= src[read..read + len].last().is_some_and(|&b| is_blank(b)) as usize;
         }
 
-        // NOTE: 32 bytes a chunk, as many as the encoder carries, so that one
-        // call with `ROOM` encodes all of them but the bytes it holds.
+        // NOTE: 32 bytes at most, the encoder's carry, so `finish` stays small.
         let len = len.min(32);
 
         if len == 0 {
@@ -165,9 +148,6 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
                 break;
             }
 
-            // NOTE: the bytes to escape, the line feeds and the CRs they drop;
-            // `b` and `c` hold the bytes one and two on, `end` the input's
-            // last byte.
             let [a, b, c] = vectors(&bytes, 16 * half);
             let end = match last && len == rest && 16 * half + n == len {
                 true => load(LAST[16 - n..].first_chunk().unwrap()),
@@ -187,8 +167,6 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
                 esc = vorrq_u8(vbicq_u8(esc, vorrq_u8(lf, drop)), vandq_u8(blank, breaks));
             }
 
-            // NOTE: the first, second and third byte each byte takes, 0x80
-            // where it takes none, spread three lanes a byte.
             let nibbles = [vshrq_n_u8::<4>(a), vandq_u8(a, vdupq_n_u8(0xf))];
             let digits = nibbles.map(|v| vqtbl1q_u8(hex, v));
             let eol = vdupq_n_u8(if crlf { b'\r' } else { b'\n' });
@@ -213,8 +191,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
             let mut out = 0;
 
             for (i, v) in lanes.into_iter().enumerate() {
-                // SAFETY: a chunk has `ROOM` bytes, and its groups write 150 at
-                // most.
+                // SAFETY: a chunk has `ROOM` bytes, more than its groups write.
                 out += unsafe { compress(v, (keep >> (16 * i)) as u32, to.add(out)) };
             }
 
@@ -288,8 +265,7 @@ fn within(v: uint8x16_t, low: u8, high: u8) -> uint8x16_t {
     vcleq_u8(vsubq_u8(v, vdupq_n_u8(low)), vdupq_n_u8(high - low))
 }
 
-/// A bit for each lane of `v`, a compare's result: its lanes weighted by their
-/// bit and summed, half by half.
+/// A bit for each lane of the compare result `v`, summed half by half.
 #[target_feature(enable = "neon")]
 fn mask(v: uint8x16_t) -> u32 {
     let bits = vandq_u8(v, vreinterpretq_u8_u64(vdupq_n_u64(0x8040_2010_0804_0201)));

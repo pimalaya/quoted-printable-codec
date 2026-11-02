@@ -1,9 +1,7 @@
 //! # CPU token
 //!
-//! [`QuotedPrintableCpu`], the backend a
-//! [`QuotedPrintableCodec`](crate::codec::QuotedPrintableCodec) runs, picked
-//! from a [`SimdCpu`]: one the caller hands over, or by default the one the
-//! application installed. The library never detects CPU features.
+//! [`QuotedPrintableCpu`], the backend a codec runs, picked from a
+//! [`SimdCpu`]: the caller's, or by default the installed one.
 
 use simd_cpu::SimdCpu;
 
@@ -14,9 +12,8 @@ pub struct QuotedPrintableCpu {
 }
 
 impl QuotedPrintableCpu {
-    /// The widest backend `cpu` has the features of: on x86_64 AVX-512 with
-    /// VBMI and VBMI2, BMI1, BMI2, LZCNT and POPCNT, then AVX2 with BMI1,
-    /// LZCNT and POPCNT; NEON on aarch64; the portable one otherwise.
+    /// The widest backend `cpu` supports: AVX-512 (VBMI, VBMI2, BMI1, BMI2,
+    /// LZCNT, POPCNT), AVX2 (BMI1, LZCNT, POPCNT), NEON, then portable.
     pub const fn new(cpu: SimdCpu) -> Self {
         use simd_cpu::SimdFeature::{
             Avx2, Avx512Vbmi, Avx512Vbmi2, Bmi1, Bmi2, Lzcnt, Neon, Popcnt,
@@ -44,8 +41,7 @@ impl QuotedPrintableCpu {
 }
 
 impl Default for QuotedPrintableCpu {
-    /// The backend of [`SimdCpu::current`]: the token the application
-    /// installed, or [`SimdCpu::BASELINE`] when it installed none.
+    /// The backend of [`SimdCpu::current`], the installed or baseline token.
     #[inline]
     fn default() -> Self {
         Self::new(SimdCpu::current())
@@ -55,22 +51,20 @@ impl Default for QuotedPrintableCpu {
 /// A backend of the codec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QuotedPrintableBackend {
-    /// Safe blocks of 32 bytes the compiler vectorizes, on every target.
+    /// Safe 32-byte blocks the compiler vectorizes, on every target.
     Portable,
-    /// AVX2 blocks of 32 bytes, compressed through byte shuffles, and BMI1.
+    /// AVX2 32-byte blocks, compressed through byte shuffles.
     #[cfg(target_arch = "x86_64")]
     Avx2,
-    /// AVX-512 blocks of 64 bytes with the VBMI2 byte compress, and BMI1 and
-    /// BMI2.
+    /// AVX-512 64-byte blocks, compressed by VBMI2.
     #[cfg(target_arch = "x86_64")]
     Avx512,
-    /// NEON blocks of 16 bytes, compressed through table lookups.
+    /// NEON 16-byte blocks, compressed through table lookups.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     Neon,
 }
 
-/// The backends the running CPU supports, portable first, then from the
-/// narrowest.
+/// The backends the running CPU supports, narrowest first.
 #[cfg(test)]
 pub(crate) fn available() -> alloc::vec::Vec<QuotedPrintableCpu> {
     let cpu = SimdCpu::detect();

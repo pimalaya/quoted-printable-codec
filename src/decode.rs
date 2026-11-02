@@ -1,23 +1,17 @@
 //! # Decoding
 //!
-//! Lenient quoted-printable decoding of a MIME body, as RFC 2045 6.7 asks
-//! of robust implementations: `=XX` escapes become bytes, lowercase hex
-//! digits included; soft breaks (`=`, optional spaces or tabs, then a line
-//! break or the end of the input) are joined; the spaces and tabs that end a
-//! line or the input are deleted; CRLF and bare LF are kept as they are, and
-//! a bare CR is dropped; a malformed escape keeps its `=` literally, and
-//! anything else is kept. Decoding never fails: it returns the bytes, and
+//! Lenient quoted-printable decoding of a MIME body, as RFC 2045 6.7 asks of
+//! robust implementations. Escapes decode in either case, soft breaks join,
+//! trailing blanks go, CRLF and LF stay, a bare CR is dropped, a malformed
+//! escape keeps its `=`. Decoding never fails: it returns the bytes and
 //! whether the input was clean.
 //!
-//! In Q mode, the RFC 2047 encoding of header words, `_` becomes a space,
-//! `=XX` a byte, lowercase digits included, and every other byte is kept as
-//! it is: only a malformed escape makes the input unclean, as encoded words
-//! in the wild carry raw bytes and lowercase digits.
+//! Q mode (RFC 2047) reads `_` as a space and escapes in either case, and
+//! keeps other bytes. Only a malformed escape makes it unclean, as words in
+//! the wild carry raw bytes and lowercase digits.
 //!
-//! [`QuotedPrintableDecode`] takes the input chunk by chunk; the one-shot
-//! [`QuotedPrintableCodec::decode`] and `QuotedPrintableCodec::decode_vec`
-//! run its core once over a whole input. Encoding is the sibling module
-//! [`encode`](crate::encode).
+//! [`QuotedPrintableDecode`] takes the input chunk by chunk;
+//! [`QuotedPrintableCodec::decode`] takes it whole.
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -33,20 +27,16 @@ use crate::{
     is_blank, is_plain, mask, pad, window,
 };
 
-/// The most trailing spaces and tabs a line break deletes: past them, the
-/// oldest are kept as data, as no well-formed line holds that many.
+/// The most trailing blanks a line break deletes; older ones stay as data.
 const BLANKS_MAX: usize = 76;
 
-/// The longest token the decoder cannot decide yet, `=`, the most blanks
-/// and a CR, and room for one more byte.
+/// The longest undecided token (`=`, the most blanks, a CR), plus one byte.
 const CARRY: usize = BLANKS_MAX + 4;
 
-/// I/O-free quoted-printable decoder, resumed with the caller's input and
-/// output buffers.
+/// I/O-free quoted-printable decoder, resumed with the caller's buffers.
 ///
-/// The input can be cut anywhere, mid-escape included: the decoder carries
-/// an unfinished escape or soft break, a CR, and the spaces and tabs that
-/// may end a line.
+/// The input can be cut anywhere: an unfinished escape or soft break, a CR
+/// and trailing blanks are carried to the next call.
 ///
 /// ```
 /// use quoted_printable_codec::{codec::QuotedPrintableCodec, decode::QuotedPrintableDecode};
@@ -72,11 +62,9 @@ pub struct QuotedPrintableDecode {
 }
 
 impl QuotedPrintableDecode {
-    /// Builds a decoder running the backend of `codec`, whatever its line
-    /// ending: the text of encoded words in Q mode, a MIME body otherwise.
+    /// Builds a decoder running `codec`, whose line ending it ignores.
     pub fn new(codec: QuotedPrintableCodec) -> Self {
-        // NOTE: not `..Self::default()`, which would build a default codec,
-        // reading the installed token, only to drop it.
+        // NOTE: not `..Self::default()`, which reads the installed token.
         Self {
             codec,
             edge: Edge::default(),
@@ -86,9 +74,8 @@ impl QuotedPrintableDecode {
 
     /// Decodes as much of `src` as fits in `dst`.
     ///
-    /// The caller drains `dst` and resumes with the rest of `src` or the
-    /// next chunk; one byte of room always lets the decoder progress. The
-    /// bytes of `dst` past the ones written may be overwritten.
+    /// The caller drains `dst` and resumes with the rest; one byte of room
+    /// always progresses. Bytes past the written ones may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableDecodeOutput {
         let (codec, dirty) = (self.codec, &mut self.dirty);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
@@ -102,11 +89,11 @@ impl QuotedPrintableDecode {
         }
     }
 
-    /// Ends the input: writes what is still queued and a malformed escape
-    /// left unfinished, and drops the trailing spaces, tabs and CR.
+    /// Ends the input: writes the queue and an unfinished escape, and drops
+    /// trailing blanks and CR.
     ///
-    /// Returns none, writing nothing, when `dst` is too short; otherwise the
-    /// decoder starts over for another input.
+    /// Returns none, writing nothing, when `dst` is too short; otherwise
+    /// resets the decoder.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         let mut dirty = self.dirty;
         let written = self.edge.finish(dst, |src, dst| {
@@ -138,8 +125,8 @@ impl QuotedPrintableCodec {
     /// Decodes the whole of `src` into `dst`.
     ///
     /// Returns none, writing nothing, when `dst` is shorter than
-    /// [`decoded_len_max`](Self::decoded_len_max) asks. The bytes of `dst`
-    /// past the ones written may be overwritten, to its end.
+    /// [`decoded_len_max`](Self::decoded_len_max). Bytes past the written
+    /// ones may be overwritten.
     #[inline]
     pub fn decode(self, src: &[u8], dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         if dst.len() < self.decoded_len_max(src.len()) {
@@ -168,22 +155,18 @@ impl QuotedPrintableCodec {
         output.clean
     }
 
-    /// The most bytes [`decode`](Self::decode) writes for an input of `len`
-    /// bytes, whatever they hold: every output byte comes from at least one
-    /// input byte.
+    /// The most bytes [`decode`](Self::decode) writes for `len` input bytes:
+    /// each output byte takes one input byte at least.
     pub const fn decoded_len_max(self, len: usize) -> usize {
         len
     }
 }
 
-/// Decodes the tokens of `src` into `dst`, at least as long, with the
-/// blocks of the backend the codec's token names, or in Q mode the Q loop,
-/// returning the bytes read, written and held.
+/// Decodes `src` into `dst`, at least as long, with the codec's backend or
+/// the Q loop, returning the bytes read, written and held.
 ///
-/// Unless `last` tells that the input ends with `src`, an escape, a soft
-/// break or a CR cut short is left unread, and the spaces and tabs a line
-/// break would delete are held: written past the ones counted, for the
-/// caller to carry.
+/// Unless `last`, a cut escape, soft break or CR is left unread, and blanks
+/// a line break would delete are held, written past the counted ones.
 fn tokens(
     codec: QuotedPrintableCodec,
     src: &[u8],
@@ -199,7 +182,7 @@ fn tokens(
     let mut read = 0;
     let mut written = 0;
     let mut blanks = 0;
-    // NOTE: padded first, so that its stores are done when blocks load them.
+    // NOTE: padded first, so its stores land before blocks load them.
     let mut end = [0; 128];
 
     if cpu.backend() == QuotedPrintableBackend::Portable {
@@ -281,11 +264,11 @@ fn tokens(
     }
 }
 
-/// Decodes the Q text `src` into `dst`, at least as long, returning the bytes
-/// read and written, and none held: `_` reads as a space and an escape in
-/// either case as its byte, a `=` starting no escape stays and turns `dirty`
-/// true, and any other byte stays. Unless `last`, a `=` less than 2 bytes from
-/// the end of `src` is left unread.
+/// Decodes Q text `src` into `dst`, at least as long, returning the bytes
+/// read, written and held (none).
+///
+/// A `=` starting no escape stays and sets `dirty`. Unless `last`, a `=`
+/// within 2 bytes of the end is left unread.
 fn words(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3] {
     let mut read = 0;
     let mut written = 0;
@@ -312,16 +295,13 @@ fn words(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3]
     [read, written, 0]
 }
 
-/// Decodes `src` into `dst`, at least as long, in blocks of 32 bytes, up to
-/// the first byte a block leaves to the token steps or the end of `src`,
-/// returning the bytes read and written; `end` holds the end of the input as
-/// [`pad`] copies it, `prev` tells whether a space or tab comes before `src`,
-/// and `dirty` turns true on a byte that is not clean.
+/// Decodes `src` into `dst`, at least as long, in 32-byte blocks, up to the
+/// first byte left to the token steps, returning the bytes read and written.
 ///
-/// A block reads the 2 bytes after it ahead, and runs past its end to the end
-/// of an escape or a soft break that starts in it. It decodes literal bytes,
-/// escapes, soft breaks, and CRLF or LF with no blank before them: a
-/// malformed escape, a bare CR or a line break after a blank ends it.
+/// `end` is the input's end as [`pad`] copies it, `prev` tells whether a
+/// blank precedes `src`, and `dirty` is set on an unclean byte. A block reads
+/// 2 bytes ahead and runs past its end to finish an escape or soft break. A
+/// malformed escape, a bare CR or a line break after a blank stops it.
 #[inline(never)]
 fn blocks(src: &[u8], end: &[u8; 128], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
     let mut read = 0;

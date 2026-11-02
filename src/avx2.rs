@@ -1,16 +1,9 @@
 //! # AVX2 backend
 //!
-//! The steps of the AVX-512 backend on vectors of 32 bytes, for the x86_64
-//! CPUs without AVX-512 VBMI2, such as Intel's client CPUs since Alder Lake
-//! and AMD's before Zen 4. `vpshufb` compresses bytes 8 lanes at a time from a
-//! table of shuffles, and no step takes `pext` or `pdep`, which Zen 2 runs in
-//! microcode. Decoding reads every escape of a block of 32 bytes at once, from
-//! the block loaded again one and two bytes on, and compresses the digits and
-//! soft breaks away. Encoding builds the bytes each byte of a chunk of 32 may
-//! take, spreads each group of 16 over the three lanes of its escape,
-//! compresses away the lanes it does not use, marked by their high bit, and
-//! places the one soft break a group may need at offsets counted from the
-//! masks of its bytes.
+//! The AVX-512 steps on 32-byte vectors, for x86_64 CPUs without AVX-512
+//! VBMI2. `vpshufb` compresses 8 lanes at a time from a shuffle table. No
+//! step uses `pext` or `pdep`, microcoded on Zen 2. Encoding marks unused
+//! lanes by their high bit and places the soft break with [`line()`].
 
 use core::arch::x86_64::*;
 
@@ -21,9 +14,8 @@ use crate::{
     is_blank,
 };
 
-/// For each of the three vectors a group of 16 bytes spreads over, the lanes
-/// it takes from the first, the second and the third byte each byte takes,
-/// three lanes a byte; elsewhere 0x80, which `vpshufb` reads as zero.
+/// The lanes each of a group's three vectors takes from the three bytes each
+/// input byte becomes; 0x80 elsewhere, zero to `vpshufb`.
 static SPREADS: [[[u8; 16]; 3]; 3] = {
     let mut table = [[[0x80; 16]; 3]; 3];
     let mut lane = 0;
@@ -43,19 +35,15 @@ static LAST: [u8; 63] = {
     table
 };
 
-/// Decodes `src` into `dst`, at least as long, up to the first byte the
-/// token steps decide or the end of `src`, as the portable blocks do;
-/// `prev` tells whether a space or tab comes before `src`.
+/// Decodes like the portable blocks; `prev` tells whether a blank precedes
+/// `src`.
 #[target_feature(enable = "avx2,bmi1,lzcnt,popcnt")]
 pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -> [usize; 2] {
     let mut read = 0;
     let mut written = 0;
     let mut bad = 0;
-    // NOTE: the lanes the last block's escape or soft break runs over, and
-    // whether a blank ends it.
     let [mut carry, mut prev] = [0, prev as u32];
 
-    // Whether each lane of `v` is a hex digit, either case, and its value.
     let digit = |v| {
         let letter = within(_mm256_or_si256(v, splat(0x20)), b'a', b'f');
         let digit = _mm256_or_si256(within(v, b'0', b'9'), letter);
@@ -92,8 +80,6 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
         let done = valid & first(stop);
         bad |= (lower | !(text | tab | cr | lf)) & done;
 
-        // NOTE: compressed straight into `dst` when it has 32 bytes left, so
-        // that no write passes its end.
         let keep = done & !gone;
         let mut spare = [0; 32];
         let direct = dst.len() - written >= 32;
@@ -101,8 +87,7 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
             true => dst[written..].as_mut_ptr(),
             false => spare.as_mut_ptr(),
         };
-        // SAFETY: 32 bytes are writable from `to`, and the first half writes
-        // 16 at most.
+        // SAFETY: 32 bytes are writable from `to`; a half writes 16 at most.
         let n = unsafe { compress(_mm256_castsi256_si128(out), keep, to) };
         // SAFETY: as above.
         let n = n + unsafe { compress(_mm256_extracti128_si256(out, 1), keep >> 16, to.add(n)) };
@@ -126,8 +111,7 @@ pub(crate) fn decode(src: &[u8], dst: &mut [u8], prev: bool, dirty: &mut bool) -
     [read, written]
 }
 
-/// Encodes `src` into `dst` from `column` in chunks of two groups of 16
-/// bytes, as many as fit, as the portable walk does.
+/// Encodes like the portable walk, in chunks of two groups of 16 bytes.
 #[target_feature(enable = "avx2,bmi1,lzcnt,popcnt")]
 pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     src: &[u8],
@@ -146,10 +130,6 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
     let mut written = 0;
     let mut col = *column;
 
-    // The first, second and third byte each byte of `a` takes, 0x80 where it
-    // takes none, and the bytes to escape, the line feeds and the CRs they
-    // drop; `b` and `c` hold the bytes one and two on, `end` the input's last
-    // byte.
     let bytes = |a, b, c, end| {
         let or = |a, b| _mm256_or_si256(a, b);
         let and = |a, b| _mm256_and_si256(a, b);
@@ -193,8 +173,6 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         (lanes, [esc, lf, drop].map(|v| mask(v)))
     };
 
-    // Encodes the first `n` bytes of a group, spread over `lanes`, its masks
-    // `masks`, at `at` in `dst`, returning the bytes written.
     let mut group = |lanes: [__m128i; 3], masks, n: usize, at| {
         let to = base.wrapping_add(at);
         let keep = lanes.iter().rev().fold(0, |keep, &v| {
@@ -204,8 +182,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let mut len = 0;
 
         for (i, v) in lanes.into_iter().enumerate() {
-            // SAFETY: a chunk has `ROOM` bytes, and its groups write 150 at
-            // most.
+            // SAFETY: a chunk has `ROOM` bytes, more than its groups write.
             len += unsafe { compress(v, (keep >> (16 * i)) as u32, to.add(len)) };
         }
 
@@ -233,8 +210,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
         let rest = src.len() - read;
         let mut len = rest;
 
-        // NOTE: unless `last`, a space, tab or CR ending `src` waits for the
-        // next byte.
+        // NOTE: unless `last`, a trailing blank or CR waits for the next byte.
         if !last {
             len -= (TEXT && src[read..].ends_with(b"\r")) as usize;
             len -= src[read..read + len].last().is_some_and(|&b| is_blank(b)) as usize;
@@ -248,8 +224,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool>(
 
         let [a, b, c] = window(&src[read..]);
         let end = match last && len == rest {
-            // SAFETY: `LAST` holds the 32 bytes from `32 - len`, as `len` is
-            // 1 to 32.
+            // SAFETY: `len` is 1 to 32, so `LAST` holds 32 bytes from there.
             true => unsafe { _mm256_loadu_si256(LAST.as_ptr().add(32 - len).cast()) },
             false => _mm256_setzero_si256(),
         };
