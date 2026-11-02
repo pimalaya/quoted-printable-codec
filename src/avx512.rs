@@ -129,8 +129,7 @@ pub(crate) fn encode<const TEXT: bool, const CRLF: bool, const GUARD: bool>(
     let (soft, soft_len) = eol.soft_break();
     let crlf = TEXT && CRLF;
     let base = dst.as_mut_ptr();
-    // NOTE: opaque, or LLVM fuses the spreads into `vpermt2b`, measured slower.
-    let [_, _, _, spreads @ .., hex] = core::hint::black_box(&TABLES).each_ref().map(|t| load(t));
+    let [_, _, _, spreads @ .., hex] = TABLES.each_ref().map(|t| load(t));
     let mut read = 0;
     let mut written = 0;
     let mut col = *column;
