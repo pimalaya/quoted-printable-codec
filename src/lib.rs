@@ -1,12 +1,13 @@
 //! # quoted-printable-codec
 //!
-//! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7),
-//! lenient as mail needs it, with SIMD, `no_std` and no I/O.
+//! Quoted-printable encoding and decoding of MIME bodies (RFC 2045 6.7) and
+//! of the Q encoding of header words (RFC 2047 4.2), lenient as mail needs
+//! it, with SIMD, `no_std` and no I/O.
 //!
 //! A [`QuotedPrintableCodec`], from [`codec`], holds what every call runs:
 //! a [`QuotedPrintableCpu`] backend token, picked from the `simd_cpu::SimdCpu`
-//! the application gets once, usually from `SimdCpu::detect`, the mode, text
-//! or binary, and the line ending of encoded output. Its one-shot methods
+//! the application gets once, usually from `SimdCpu::detect`, the mode, body
+//! text, body binary or Q, and the line ending of encoded output. Its one-shot methods
 //! take a whole input at once. [`QuotedPrintableEncode`] and
 //! [`QuotedPrintableDecode`], from [`encode`] and [`decode`], take a codec,
 //! then the caller's input and output buffers chunk by chunk, as any I/O-free
@@ -18,14 +19,16 @@
 //! The AVX-512 backend reads blocks of 64 bytes with no branch on the data:
 //! decoding reads every escape of a block at once and compresses the rest
 //! away, encoding spreads each byte over the three lanes of its escape and
-//! compresses the unused ones away. Both leave to token steps what a block
-//! does not decide alone, such as a malformed escape or blanks before a line
-//! break, and the coroutines keep only the few bytes they cannot decide yet,
-//! or have no room for, between two calls.
+//! compresses the unused ones away. The AVX2 and NEON backends take the same
+//! steps on blocks of 32 and 16 bytes, compressing through tables of byte
+//! shuffles. Every backend leaves to token steps what a block does not decide
+//! alone, such as a malformed escape or blanks before a line break, and the
+//! coroutines keep only the few bytes they cannot decide yet, or have no room
+//! for, between two calls.
 //!
 //! ```
 //! use quoted_printable_codec::{
-//!     codec::{QuotedPrintableCodec, QuotedPrintableEol},
+//!     codec::{QuotedPrintableCodec, QuotedPrintableEol, QuotedPrintableMode},
 //!     cpu::QuotedPrintableCpu,
 //! };
 //! use simd_cpu::SimdCpu;
@@ -34,7 +37,7 @@
 //! let codec = QuotedPrintableCodec {
 //!     cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
 //!     eol: QuotedPrintableEol::Crlf,
-//!     binary: false,
+//!     mode: QuotedPrintableMode::Text,
 //! };
 //!
 //! let mut encoded = [0; 256];
@@ -46,6 +49,13 @@
 //! let output = codec.decode(&encoded[..len], &mut decoded).unwrap();
 //! assert_eq!(&decoded[..output.written], "Grüße,\r\nJürgen\r\n".as_bytes());
 //! assert!(output.clean);
+//!
+//! // The text of an encoded word, `=?UTF-8?Q?Gr=C3=BC=C3=9Fe_J=C3=BCrgen?=`.
+//! let words = QuotedPrintableCodec { mode: QuotedPrintableMode::Q, ..codec };
+//! let input = "Grüße Jürgen".as_bytes();
+//! let len = words.encode(input, &mut encoded).unwrap();
+//! assert_eq!(&encoded[..len], b"Gr=C3=BC=C3=9Fe_J=C3=BCrgen");
+//! assert_eq!(words.encoded_len(input), len);
 //! ```
 //!
 //! [`QuotedPrintableCodec`]: codec::QuotedPrintableCodec
@@ -63,12 +73,16 @@ extern crate alloc;
 extern crate std;
 
 #[cfg(target_arch = "x86_64")]
+mod avx2;
+#[cfg(target_arch = "x86_64")]
 mod avx512;
 pub mod codec;
 pub mod cpu;
 pub mod decode;
 mod edge;
 pub mod encode;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon;
 
 /// The bytes both directions copy as they are: printable ASCII but `=`,
 /// space and tab.
@@ -112,12 +126,42 @@ fn window<'a>(src: &'a [u8], end: &'a [u8; 128]) -> &'a [u8; 64] {
         .unwrap_or_else(|| end[64 - src.len()..].first_chunk().unwrap())
 }
 
+/// For each mask of 8 lanes, the lanes it holds in order, then 0x80: the byte
+/// shuffle moving them to the front, as the AVX2 and NEON backends compress
+/// bytes.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
+static COMPRESS: [[u8; 8]; 256] = {
+    let mut table = [[0x80; 8]; 256];
+    let mut mask = 0;
+
+    while mask < 256 {
+        let mut lane = 0;
+        let mut n = 0;
+
+        while lane < 8 {
+            if mask >> lane & 1 == 1 {
+                table[mask][n] = lane as u8;
+                n += 1;
+            }
+
+            lane += 1;
+        }
+
+        mask += 1;
+    }
+
+    table
+};
+
 #[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
 
     use crate::{
-        codec::{QuotedPrintableCodec, QuotedPrintableEol},
+        codec::{QuotedPrintableCodec, QuotedPrintableEol, QuotedPrintableMode},
         cpu::{QuotedPrintableCpu, available},
         decode::*,
         encode::*,
@@ -136,11 +180,11 @@ mod tests {
     }
 
     /// Bodies of up to 300 bytes, mostly the bytes both directions treat
-    /// apart.
+    /// apart: 2,000, or 20 under Miri.
     fn bodies(random: &mut Random) -> Vec<Vec<u8>> {
         let bytes = b"aaaaaaaaaaaaaaaaaaaaaaaa==== \t\t\r\n\r\n09AFaf\x00\x7f\xc3\xff";
 
-        (0..2000)
+        (0..if cfg!(miri) { 20 } else { 2000 })
             .map(|_| {
                 let len = random.below(300);
                 (0..len).map(|_| bytes[random.below(bytes.len())]).collect()
@@ -148,14 +192,14 @@ mod tests {
             .collect()
     }
 
-    /// Every mode and line ending under `cpu`.
+    /// Every body mode and line ending under `cpu`.
     fn codecs(cpu: QuotedPrintableCpu) -> [QuotedPrintableCodec; 4] {
-        [false, true]
-            .map(|binary| {
+        [QuotedPrintableMode::Text, QuotedPrintableMode::Binary]
+            .map(|mode| {
                 [QuotedPrintableEol::Crlf, QuotedPrintableEol::Lf].map(|eol| QuotedPrintableCodec {
                     cpu,
                     eol,
-                    binary,
+                    mode,
                 })
             })
             .concat()
@@ -170,11 +214,7 @@ mod tests {
         out
     }
 
-    fn decoded(src: &[u8], cpu: QuotedPrintableCpu) -> (Vec<u8>, bool) {
-        let codec = QuotedPrintableCodec {
-            cpu,
-            ..<_>::default()
-        };
+    fn decoded(src: &[u8], codec: QuotedPrintableCodec) -> (Vec<u8>, bool) {
         let mut out = vec![0; codec.decoded_len_max(src.len())];
         let output = codec.decode(src, &mut out).unwrap();
         out.truncate(output.written);
@@ -187,7 +227,16 @@ mod tests {
 
         for body in bodies(&mut random) {
             for cpu in available() {
-                for codec in codecs(cpu) {
+                let text = QuotedPrintableCodec {
+                    cpu,
+                    ..<_>::default()
+                };
+                let q = QuotedPrintableCodec {
+                    mode: QuotedPrintableMode::Q,
+                    ..text
+                };
+
+                for codec in codecs(cpu).into_iter().chain([q]) {
                     let mut encoder = QuotedPrintableEncode::new(codec);
                     let mut out = Vec::new();
 
@@ -213,11 +262,12 @@ mod tests {
                     assert_eq!(out, encoded(&body, portable));
                 }
 
-                for src in [body.clone(), encoded(&body, <_>::default())] {
-                    let codec = QuotedPrintableCodec {
-                        cpu,
-                        ..<_>::default()
-                    };
+                for (src, codec) in [
+                    (body.clone(), text),
+                    (encoded(&body, text), text),
+                    (body.clone(), q),
+                    (encoded(&body, q), q),
+                ] {
                     let mut decoder = QuotedPrintableDecode::new(codec);
                     let mut out = Vec::new();
 
@@ -236,14 +286,19 @@ mod tests {
                     let end = decoder.finish(&mut room).unwrap();
                     out.extend_from_slice(&room[..end.written]);
                     let output = (out, end.clean);
-                    assert_eq!(output, decoded(&src, cpu));
-                    assert_eq!(output, decoded(&src, available()[0]));
+                    let portable = QuotedPrintableCodec {
+                        cpu: available()[0],
+                        ..codec
+                    };
+                    assert_eq!(output, decoded(&src, codec));
+                    assert_eq!(output, decoded(&src, portable));
                 }
             }
         }
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "hashes the 2,000 bodies Miri skips")]
     fn a_frozen_corpus_keeps_its_output() {
         for cpu in available() {
             let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -256,13 +311,17 @@ mod tests {
             for body in bodies(&mut Random(0x0f1e_2d3c_4b5a_6978)) {
                 for codec in codecs(cpu) {
                     let out = encoded(&body, codec);
-                    let (back, clean) = decoded(&out, cpu);
+                    let (back, clean) = decoded(&out, codec);
                     fold(&out);
                     fold(&back);
                     fold(&[clean as u8]);
                 }
 
-                let (out, clean) = decoded(&body, cpu);
+                let text = QuotedPrintableCodec {
+                    cpu,
+                    ..<_>::default()
+                };
+                let (out, clean) = decoded(&body, text);
                 fold(&out);
                 fold(&[clean as u8]);
             }
@@ -292,7 +351,7 @@ mod tests {
                 let written = decoder.resume(src, &mut out).written;
                 let end = decoder.finish(&mut out[written..]).unwrap();
                 let output = (out[..written + end.written].to_vec(), end.clean);
-                assert_eq!(output, decoded(src, cpu));
+                assert_eq!(output, decoded(src, codec));
             }
         }
     }

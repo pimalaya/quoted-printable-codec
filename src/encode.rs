@@ -7,7 +7,11 @@
 //! LF are escaped like any other byte and the output has soft line breaks
 //! only. `=`, bytes from 0x7F up, control characters other than TAB, a bare
 //! CR in text mode and a space or tab that would end a line are escaped as
-//! `=XX`, uppercase; an escape is never split across lines.
+//! `=XX`, uppercase; an escape is never split across lines. In Q mode, the
+//! RFC 2047 encoding of header words, letters, digits and `!*+-/` stay
+//! literal, a space becomes `_`, every other byte is escaped, and no line
+//! breaks at all: the caller splits the text into encoded words, which
+//! [`QuotedPrintableCodec::encoded_len`] sizes exactly.
 //!
 //! [`QuotedPrintableEncode`] takes the input chunk by chunk; the one-shot
 //! [`QuotedPrintableCodec::encode`] and `QuotedPrintableCodec::encode_vec`
@@ -17,9 +21,15 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use crate::neon;
 #[cfg(target_arch = "x86_64")]
-use crate::avx512;
-use crate::{codec::QuotedPrintableCodec, edge::Edge, is_blank, is_plain, mask, pad, window};
+use crate::{avx2, avx512};
+use crate::{
+    codec::{QuotedPrintableCodec, QuotedPrintableMode},
+    edge::Edge,
+    is_blank, is_plain, mask, pad, window,
+};
 
 /// The most characters a line holds before its soft break `=`.
 pub(crate) const LINE: usize = 75;
@@ -27,8 +37,30 @@ pub(crate) const LINE: usize = 75;
 /// The output bytes a block may touch: a portable block commits at most 32
 /// escapes and two soft breaks, under 128 bytes, and copies a run whole past
 /// them; an AVX-512 chunk writes three groups of at most 66 bytes, and up to
-/// 68 bytes past the start of each.
+/// 68 bytes past the start of each; an AVX2 or NEON group writes at most 51
+/// bytes, and up to 99 past its start.
 pub(crate) const ROOM: usize = 200;
+
+/// Runs the SIMD encoder `$kernel`, built for the mode and the line ending of
+/// `$codec`.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
+macro_rules! kernel {
+    ($($kernel:ident)::+, $codec:expr, $($arg:expr),+) => {{
+        use crate::codec::{QuotedPrintableEol, QuotedPrintableMode};
+
+        let binary = $codec.mode == QuotedPrintableMode::Binary;
+
+        match (binary, $codec.eol) {
+            (false, QuotedPrintableEol::Crlf) => $($kernel)::+::<true, true>($($arg),+),
+            (false, QuotedPrintableEol::Lf) => $($kernel)::+::<true, false>($($arg),+),
+            (true, QuotedPrintableEol::Crlf) => $($kernel)::+::<false, true>($($arg),+),
+            (true, QuotedPrintableEol::Lf) => $($kernel)::+::<false, false>($($arg),+),
+        }
+    }};
+}
 
 /// I/O-free quoted-printable encoder, resumed with the caller's input and
 /// output buffers.
@@ -144,6 +176,36 @@ impl QuotedPrintableCodec {
         let breaks = (len / 25 + 1).checked_mul(self.eol.soft_break().1)?;
         len.checked_mul(3)?.checked_add(breaks + ROOM)
     }
+
+    /// The exact number of bytes [`encode`](Self::encode) writes for `src`:
+    /// counted in Q mode, encoded into a scratch buffer in the others.
+    pub fn encoded_len(self, src: &[u8]) -> usize {
+        if self.mode == QuotedPrintableMode::Q {
+            let width = |&byte: &u8| {
+                if is_phrase(byte) || byte == b' ' {
+                    1
+                } else {
+                    3
+                }
+            };
+            return src.iter().map(width).sum();
+        }
+
+        let mut encoder = QuotedPrintableEncode::new(self);
+        // NOTE: what `finish` writes, its queue and the carry it encodes, fits
+        // in twice `ROOM`.
+        let mut scratch = [0; 2 * ROOM];
+        let mut src = src;
+        let mut len = 0;
+
+        while !src.is_empty() {
+            let output = encoder.resume(src, &mut scratch);
+            src = &src[output.read..];
+            len += output.written;
+        }
+
+        len + encoder.finish(&mut scratch).unwrap_or(0)
+    }
 }
 
 /// Encodes `src` into `dst` from `column`, as much as fits, with the blocks of
@@ -159,21 +221,98 @@ fn blocks(
     codec: QuotedPrintableCodec,
     column: &mut usize,
 ) -> [usize; 3] {
-    match (codec.cpu.wide(src), codec.binary) {
+    match (codec.mode, codec.cpu.backend()) {
+        (QuotedPrintableMode::Q, _) => words(src, dst),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the codec's token names the AVX-512 backend, which the CPU
         // supports.
-        (true, binary) => unsafe {
-            match (binary, codec.eol.soft_break().1 == 3) {
-                (true, true) => avx512::encode::<false, true>(src, dst, last, column),
-                (true, false) => avx512::encode::<false, false>(src, dst, last, column),
-                (false, true) => avx512::encode::<true, true>(src, dst, last, column),
-                (false, false) => avx512::encode::<true, false>(src, dst, last, column),
-            }
+        (_, crate::cpu::QuotedPrintableBackend::Avx512) if unsafe { avx512::dense(src) } => unsafe {
+            kernel!(avx512::encode, codec, src, dst, last, column)
         },
-        (_, true) => walk::<false>(src, dst, last, codec, column),
-        (_, false) => walk::<true>(src, dst, last, codec, column),
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the codec's token names the AVX2 backend, which the CPU
+        // supports.
+        (_, crate::cpu::QuotedPrintableBackend::Avx2) => unsafe {
+            kernel!(avx2::encode, codec, src, dst, last, column)
+        },
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        // SAFETY: the codec's token names the NEON backend, which the CPU
+        // supports.
+        (_, crate::cpu::QuotedPrintableBackend::Neon) => unsafe {
+            kernel!(neon::encode, codec, src, dst, last, column)
+        },
+        (QuotedPrintableMode::Binary, _) => walk::<false>(src, dst, last, codec, column),
+        _ => walk::<true>(src, dst, last, codec, column),
     }
+}
+
+/// Encodes `src` into `dst` in the Q encoding, as much as fits, returning the
+/// bytes read and written, and none held: every byte is a token of its own.
+fn words(src: &[u8], dst: &mut [u8]) -> [usize; 3] {
+    let mut written = 0;
+
+    for (read, &byte) in src.iter().enumerate() {
+        let (token, len) = match byte {
+            b' ' => ([b'_'; 4], 1),
+            _ if is_phrase(byte) => ([byte; 4], 1),
+            _ => (ESCAPES[byte as usize], 3),
+        };
+
+        let Some(out) = dst.get_mut(written..written + len) else {
+            return [read, written, 0];
+        };
+
+        out.copy_from_slice(&token[..len]);
+        written += len;
+    }
+
+    [src.len(), written, 0]
+}
+
+/// The bytes the Q encoding writes literally: letters, digits and `!*+-/`,
+/// the ones RFC 2047 5(3) allows in a phrase, so that a word goes anywhere.
+const fn is_phrase(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'!' | b'*' | b'+' | b'-' | b'/')
+}
+
+/// The soft break a group of the AVX2 or NEON encoder needs, if any, and the
+/// column after the group, from the bytes it escapes, the line feeds it
+/// breaks on and the CRs it drops, a bit each, the length of its output and
+/// the column before it; `crlf` tells that its line breaks are CRLF.
+///
+/// The literal or escape covering the line's first character past its room
+/// takes the break before it, unless a line break comes first. A group has
+/// at most 16 bytes, so its output fits in a line after one break.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
+pub(crate) fn line(
+    [esc, lf, drop]: [u32; 3],
+    len: usize,
+    col: usize,
+    crlf: bool,
+) -> (Option<usize>, usize) {
+    // NOTE: the output offset of byte `i`: a character for each byte before
+    // it, two more for each escape, one more for each CRLF line break, none
+    // for each CR dropped.
+    let at = |i: u32| {
+        let count = |mask: u32| (mask & !(u32::MAX << i)).count_ones() as usize;
+        i as usize + 2 * count(esc) + crlf as usize * count(lf) - count(drop)
+    };
+    let room = LINE - col;
+    let need = room < len && (lf == 0 || at(lf.trailing_zeros()) > room);
+    let cut = need.then(|| {
+        let starts = (0..).take_while(|&i| at(i) <= room);
+        starts.filter(|&i| drop >> i & 1 == 0).last().map_or(0, at)
+    });
+    let col = match (lf, cut) {
+        (0, Some(cut)) => len - cut,
+        (0, None) => col + len,
+        _ => len - at(31 - lf.leading_zeros()) - 1 - crlf as usize,
+    };
+
+    (cut, col)
 }
 
 /// The portable loop of [`blocks`], in blocks of 32 bytes reading the 2 bytes
@@ -308,15 +447,21 @@ mod tests {
     const TEXT: QuotedPrintableCodec = QuotedPrintableCodec {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
-        binary: false,
+        mode: QuotedPrintableMode::Text,
     };
 
     const BINARY: QuotedPrintableCodec = QuotedPrintableCodec {
-        binary: true,
+        mode: QuotedPrintableMode::Binary,
         ..TEXT
     };
 
-    /// The encoding of `input` under every backend, checked the same.
+    const Q: QuotedPrintableCodec = QuotedPrintableCodec {
+        mode: QuotedPrintableMode::Q,
+        ..TEXT
+    };
+
+    /// The encoding of `input` under every backend, checked the same, and as
+    /// long as `encoded_len` tells.
     fn encoded(input: &[u8], codec: QuotedPrintableCodec) -> Vec<u8> {
         let outs: Vec<_> = available()
             .into_iter()
@@ -324,6 +469,7 @@ mod tests {
                 let codec = QuotedPrintableCodec { cpu, ..codec };
                 let mut out = vec![0; codec.encoded_len_max(input.len()).unwrap()];
                 let written = codec.encode(input, &mut out).unwrap();
+                assert_eq!(codec.encoded_len(input), written);
                 out.truncate(written);
                 out
             })
@@ -373,6 +519,16 @@ mod tests {
     }
 
     #[test]
+    fn q_keeps_only_the_phrase_set() {
+        assert_eq!(encoded("a b,é?".as_bytes(), Q), b"a_b=2C=C3=A9=3F");
+        assert_eq!(
+            encoded(b"Az09!*+-/_=. \t\r\n", Q),
+            b"Az09!*+-/=5F=3D=2E_=09=0D=0A"
+        );
+        assert_eq!(encoded(&[b'x'; 200], Q), [b'x'; 200]);
+    }
+
+    #[test]
     fn long_lines_get_soft_breaks() {
         let out = text(&[b'x'; 80]);
         assert_eq!(out.len(), 83);
@@ -388,7 +544,7 @@ mod tests {
     fn the_length_bound_holds() {
         for len in 0..200 {
             for byte in [b'x', b' ', b'\n', 0xff] {
-                for codec in [TEXT, BINARY] {
+                for codec in [TEXT, BINARY, Q] {
                     let input = vec![byte; len];
                     let out = encoded(&input, codec);
                     assert!(out.len() <= codec.encoded_len_max(len).unwrap());
@@ -403,7 +559,7 @@ mod tests {
 
         for codec in available()
             .iter()
-            .flat_map(|&cpu| [TEXT, BINARY].map(|c| QuotedPrintableCodec { cpu, ..c }))
+            .flat_map(|&cpu| [TEXT, BINARY, Q].map(|c| QuotedPrintableCodec { cpu, ..c }))
         {
             let mut encoder = QuotedPrintableEncode::new(codec);
             let mut src = &input[..];
@@ -421,6 +577,31 @@ mod tests {
             let end = encoder.finish(&mut tail).unwrap();
             out.extend_from_slice(&tail[..end]);
             assert_eq!(out, encoded(&input, codec));
+        }
+    }
+
+    /// Once `resume` has read and written all it can, `finish` writes the
+    /// space, tab or CR held at most, escaped, and a soft break: 9 bytes.
+    #[test]
+    fn finish_writes_the_held_bytes_only() {
+        let input: Vec<u8> = b"x\r=\xff \t".iter().copied().cycle().take(70).collect();
+
+        for codec in available()
+            .iter()
+            .flat_map(|&cpu| [TEXT, BINARY, Q].map(|c| QuotedPrintableCodec { cpu, ..c }))
+        {
+            for len in 0..input.len() {
+                let mut encoder = QuotedPrintableEncode::new(codec);
+                let mut src = &input[..len];
+                let mut room = [0; 1];
+
+                while !src.is_empty() {
+                    src = &src[encoder.resume(src, &mut room).read..];
+                }
+
+                while encoder.resume(&[], &mut room).written > 0 {}
+                assert!(encoder.finish(&mut [0; 9]).is_some(), "{codec:?} {len}");
+            }
         }
     }
 

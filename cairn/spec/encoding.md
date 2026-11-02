@@ -6,7 +6,7 @@ status: current
 
 # Encoding
 
-Quoted-printable encoding of a MIME body (RFC 2045 6.7), in text or binary mode, with CRLF or LF line endings. The line width is not a parameter: MIME fixes it.
+Quoted-printable encoding of a MIME body (RFC 2045 6.7), in text or binary mode, with CRLF or LF line endings, and the Q encoding of the text of header words (RFC 2047 4.2), in Q mode. The line width is not a parameter: MIME fixes it, and Q writes none. Every requirement but the Q encoding is about the body modes.
 
 ### Requirement: Literal and escaped bytes
 
@@ -29,3 +29,12 @@ The encoder SHALL insert a soft break (`=` and the line ending) before a literal
 - GIVEN 80 bytes `x`
 - WHEN they are encoded
 - THEN the output is 75 `x`, `=`, CRLF, 5 `x`: 83 bytes
+
+### Requirement: The Q encoding
+
+In Q mode, the encoder SHALL write letters, digits and `!*+-/` literally, a space as `_` and every other byte as `=XX` with uppercase hex digits, and no line break of any kind (RFC 2047 4.2 and 5(3)); the line ending is ignored.
+
+#### Scenario: A phrase in Q
+- GIVEN `a b,é?` in UTF-8
+- WHEN it is encoded in Q mode
+- THEN the output is `a_b=2C=C3=A9=3F`

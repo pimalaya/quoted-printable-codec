@@ -7,7 +7,7 @@ use std::{hint::black_box, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use quoted_printable_codec::{
-    codec::{QuotedPrintableCodec, QuotedPrintableEol},
+    codec::{QuotedPrintableCodec, QuotedPrintableEol, QuotedPrintableMode},
     cpu::QuotedPrintableCpu,
 };
 use simd_cpu::SimdCpu;
@@ -15,11 +15,11 @@ use simd_cpu::SimdCpu;
 const SIZES: [usize; 4] = [64, 4 * 1024, 1024 * 1024, 10 * 1024 * 1024];
 
 /// The codec of a body, with the best backend the CPU has.
-fn codec(binary: bool) -> QuotedPrintableCodec {
+fn codec(mode: QuotedPrintableMode) -> QuotedPrintableCodec {
     QuotedPrintableCodec {
         cpu: QuotedPrintableCpu::new(SimdCpu::detect()),
         eol: QuotedPrintableEol::Crlf,
-        binary,
+        mode,
     }
 }
 
@@ -79,9 +79,17 @@ fn inputs(len: usize) -> [(&'static str, Vec<u8>, QuotedPrintableCodec); 3] {
     let binary = random().take(len).map(|word| word as u8).collect();
 
     [
-        ("ascii", prose(len, &ASCII), codec(false)),
-        ("accented", prose(len, &ACCENTED), codec(false)),
-        ("binary", binary, codec(true)),
+        (
+            "ascii",
+            prose(len, &ASCII),
+            codec(QuotedPrintableMode::Text),
+        ),
+        (
+            "accented",
+            prose(len, &ACCENTED),
+            codec(QuotedPrintableMode::Text),
+        ),
+        ("binary", binary, codec(QuotedPrintableMode::Binary)),
     ]
 }
 
@@ -102,7 +110,8 @@ fn encodes(c: &mut Criterion) {
                 |b, src| b.iter(|| codec.encode(black_box(src), &mut out)),
             );
 
-            let engine = match codec.binary {
+            let binary = codec.mode == QuotedPrintableMode::Binary;
+            let engine = match binary {
                 false => encodify::qp::BODY,
                 true => encodify::qp::BINARY,
             };
@@ -116,7 +125,7 @@ fn encodes(c: &mut Criterion) {
                 BenchmarkId::new("quoted_printable", size),
                 &src,
                 |b, src| {
-                    b.iter(|| match codec.binary {
+                    b.iter(|| match binary {
                         false => quoted_printable::encode(black_box(src)),
                         true => quoted_printable::encode_binary(black_box(src)),
                     })

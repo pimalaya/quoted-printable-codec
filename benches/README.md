@@ -45,7 +45,7 @@ Inputs: ascii is lowercase words with a few `.`, `,` and `=`, in CRLF lines of a
 
 ## Cycle counts
 
-Cycles per byte of raw input from `perf stat`, averaged over eight placements of the source and output buffers, for both backends of this tree, the AVX-512 backend of the tree before (commit 2c7604e) and encodify; cairn/changes/the-column-chain/proposal.md has them for two code layouts, with instructions and mispredictions. The portable backend is what runs on a CPU without AVX-512 VBMI2.
+Cycles per byte of raw input from `perf stat`, averaged over eight placements of the source and output buffers, for both backends of this tree, the AVX-512 backend of the tree before (commit 2c7604e) and encodify; cairn/changes/the-column-chain/proposal.md has them for two code layouts, with instructions and mispredictions. The portable backend is what ran on a CPU without AVX-512 VBMI2 until the AVX2 and NEON backends came on 2026-11-02, built for accuracy first and not measured yet.
 
 | workload | AVX-512 | portable | before | encodify |
 | --- | --- | --- | --- | --- |

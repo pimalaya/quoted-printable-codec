@@ -8,6 +8,7 @@ Quoted-printable encoder and decoder with SIMD and no_std
 - [RFC coverage](#rfc-coverage)
 - [Usage](#usage)
 - [Examples](#examples)
+- [Testing](#testing)
 - [Benchmarks](#benchmarks)
 - [AI policy](https://github.com/pimalaya/.github/blob/master/AI_POLICY.md)
 - [License](#license)
@@ -16,21 +17,24 @@ Quoted-printable encoder and decoder with SIMD and no_std
 
 ## Features
 
-- **SIMD**: AVX-512 on x86_64, the backend picked once by the application with a CPU token; safe portable code anywhere else.
+- **SIMD**: AVX-512 and AVX2 on x86_64, NEON on aarch64, the backend picked once by the application with a CPU token; safe portable code anywhere else.
 - **Fast**: up to 44x faster than encodify and 63x faster than the quoted_printable crate, see the [benchmarks](#benchmarks).
 - **MIME lines**: encodes in lines of at most 76 characters, soft breaks included, ended by CRLF or LF.
 - **Text and binary**: text mode keeps line breaks as hard breaks, binary mode escapes CR and LF like any other byte.
+- **Header words**: Q mode writes and reads the RFC 2047 Q encoding of encoded words, with an exact `encoded_len` to size them.
 - **Lenient decoding**: never fails, follows the robust rules of RFC 2045 (lowercase digits, trailing blanks, bare CRs, malformed escapes kept), and reports whether the input was clean.
 - **I/O-free**: encode and decode chunk by chunk into your own buffers.
-- **Portable**: no_std, the CPU features detected once by the application through [simd-cpu](https://github.com/pimalaya/simd-cpu), the only dependency; unsafe code only in the AVX-512 backend, and the portable one vectorized by the compiler for any target.
+- **Portable**: no_std, the CPU features detected once by the application through [simd-cpu](https://github.com/pimalaya/simd-cpu), the only dependency; unsafe code only in the SIMD backends, which Miri and fuzz targets check against the portable one, vectorized by the compiler for any target.
 
 ## RFC coverage
 
 | RFC    | What is covered                                                                                                        |
 |--------|------------------------------------------------------------------------------------------------------------------------|
 | [2045] | The quoted-printable content transfer encoding (6.7): escapes, soft line breaks, lines of 76 characters, robust decoding |
+| [2047] | The Q encoding of encoded words (4.2), with the literal set a phrase allows (5(3)); splitting text into words is the caller's |
 
 [2045]: https://www.rfc-editor.org/rfc/rfc2045#section-6.7
+[2047]: https://www.rfc-editor.org/rfc/rfc2047#section-4.2
 
 ## Usage
 
@@ -39,6 +43,18 @@ The whole API is documented on [docs.rs](https://docs.rs/quoted-printable-codec/
 ## Examples
 
 The crate ships no examples folder, a whole program adding nothing to a two-call API. The crate root, the encoder and the decoder each open with a runnable snippet.
+
+## Testing
+
+The tests run every backend the machine has against the portable one. Miri and the fuzz targets need the nightly shell, fuzz/shell.nix; Miri reaches the AVX2 kernels only with their target features and interprets the NEON ones for aarch64 on any host, and the fuzz targets are described in [fuzz/README.md](./fuzz/README.md):
+
+```sh
+nix develop --command cargo test --release --all-features
+nix-shell fuzz/shell.nix --run "cargo miri test --lib"
+nix-shell fuzz/shell.nix --run "RUSTFLAGS='-C target-feature=+avx2,+bmi1,+lzcnt,+popcnt' cargo miri test --lib"
+nix-shell fuzz/shell.nix --run "cargo miri test --lib --target aarch64-unknown-linux-gnu"
+nix-shell fuzz/shell.nix --run "cargo fuzz run encode"
+```
 
 ## Benchmarks
 
@@ -97,7 +113,7 @@ The crate ships no examples folder, a whole program adding nothing to a two-call
 
 ### Reading the numbers
 
-- quoted-printable-codec runs its AVX-512 backend here, as `QuotedPrintableCpu::new(SimdCpu::detect())` picks it; on a CPU without AVX-512 VBMI2, its portable backend runs, whose cycle counts are in [benches/README.md](./benches/README.md).
+- quoted-printable-codec runs its AVX-512 backend here, as `QuotedPrintableCpu::new(SimdCpu::detect())` picks it. A CPU without AVX-512 VBMI2 runs its AVX2 backend, and aarch64 its NEON one; neither is measured yet. The portable backend's cycle counts are in [benches/README.md](./benches/README.md).
 - ASCII is lowercase words with a few `.`, `,` and `=` in CRLF lines of about 72 characters; accented is the same with about one character in seven a two-byte UTF-8 letter; binary is pseudo-random bytes, encoded in binary mode. Decoding reads quoted-printable-codec's encoding of each, and every decoder gives back the raw bytes.
 - quoted_printable and mail-parser allocate their output, as their APIs ask; mail-parser only decodes.
 - Each cell is the median of three runs: quoted-printable-codec's encoding cells moved by up to 4% between runs, its decoding cells by up to 11%.

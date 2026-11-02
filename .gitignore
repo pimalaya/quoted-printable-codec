@@ -13,3 +13,6 @@
 /cobertura.xml
 /lcov.info
 *.profraw
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

@@ -19,3 +19,43 @@ jobs:
       - run: cargo clippy --lib --no-default-features -- -D warnings
       - run: cargo test --all-features
       - run: cargo test --no-default-features
+
+  aarch64:
+    name: test (aarch64, NEON)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  miri:
+    name: miri (portable, AVX2 and NEON kernels)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - run: cargo miri test --lib
+      - run: cargo miri test --lib
+        env:
+          RUSTFLAGS: -C target-feature=+avx2,+bmi1,+lzcnt,+popcnt
+      - run: cargo miri test --lib --target aarch64-unknown-linux-gnu
+
+  fuzz:
+    name: fuzz (short runs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Loosen ASan shadow-memory ASLR for the libFuzzer runner
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: cargo fuzz run decode -- -runs=200000
+      - run: cargo fuzz run encode -- -runs=200000

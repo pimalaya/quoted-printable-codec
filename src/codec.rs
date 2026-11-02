@@ -1,7 +1,8 @@
 //! # Codec
 //!
 //! [`QuotedPrintableCodec`], the configuration every call runs: the backend,
-//! the mode and the line ending of encoded output. Its one-shot methods, in
+//! the mode (MIME body text or binary, or the Q encoding of header words)
+//! and the line ending of encoded output. Its one-shot methods, in
 //! [`encode`](crate::encode) and [`decode`](crate::decode), encode and decode
 //! a whole input; the coroutines of those modules take it to work chunk by
 //! chunk.
@@ -19,9 +20,30 @@ pub struct QuotedPrintableCodec {
     pub cpu: QuotedPrintableCpu,
     /// The line ending of hard and soft line breaks. Decoding takes either.
     pub eol: QuotedPrintableEol,
-    /// Whether CR and LF are escaped as data rather than read as line
-    /// breaks, as binary content such as an attachment needs.
-    pub binary: bool,
+    /// What the bytes are: the text or binary content of a MIME body, or the
+    /// text of RFC 2047 encoded words.
+    pub mode: QuotedPrintableMode,
+}
+
+/// What a codec encodes and decodes.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum QuotedPrintableMode {
+    /// The text of a MIME body: its LF and CRLF line breaks are hard line
+    /// breaks, written in the codec's line ending.
+    #[default]
+    Text,
+    /// The binary content of a MIME body, such as an attachment: CR and LF
+    /// are escaped as data.
+    Binary,
+    /// The RFC 2047 4.2 Q encoding of the text of encoded words, in header
+    /// fields: letters, digits and `!*+-/` literal, a space as `_`, any other
+    /// byte escaped, and no line break, as the caller splits the text into
+    /// encoded words; decoding reads `_` as a space and reports only a `=`
+    /// starting no escape, as words in the wild carry raw bytes and lowercase
+    /// digits.
+    ///
+    /// Refs: <https://datatracker.ietf.org/doc/html/rfc2047#section-4.2>
+    Q,
 }
 
 /// The line ending of the output.

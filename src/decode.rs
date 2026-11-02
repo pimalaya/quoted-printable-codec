@@ -9,6 +9,11 @@
 //! anything else is kept. Decoding never fails: it returns the bytes, and
 //! whether the input was clean.
 //!
+//! In Q mode, the RFC 2047 encoding of header words, `_` becomes a space,
+//! `=XX` a byte, lowercase digits included, and every other byte is kept as
+//! it is: only a malformed escape makes the input unclean, as encoded words
+//! in the wild carry raw bytes and lowercase digits.
+//!
 //! [`QuotedPrintableDecode`] takes the input chunk by chunk; the one-shot
 //! [`QuotedPrintableCodec::decode`] and `QuotedPrintableCodec::decode_vec`
 //! run its core once over a whole input. Encoding is the sibling module
@@ -17,11 +22,13 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use crate::neon;
 #[cfg(target_arch = "x86_64")]
-use crate::avx512;
+use crate::{avx2, avx512};
 use crate::{
-    codec::QuotedPrintableCodec,
-    cpu::{QuotedPrintableBackend, QuotedPrintableCpu},
+    codec::{QuotedPrintableCodec, QuotedPrintableMode},
+    cpu::QuotedPrintableBackend,
     edge::Edge,
     is_blank, is_plain, mask, pad, window,
 };
@@ -59,17 +66,17 @@ const CARRY: usize = BLANKS_MAX + 4;
 /// Refs: <https://datatracker.ietf.org/doc/html/rfc2045#section-6.7>
 #[derive(Clone, Debug, Default)]
 pub struct QuotedPrintableDecode {
-    cpu: QuotedPrintableCpu,
+    codec: QuotedPrintableCodec,
     edge: Edge<CARRY, CARRY>,
     dirty: bool,
 }
 
 impl QuotedPrintableDecode {
-    /// Builds a decoder running the backend of `codec`, whatever its mode
-    /// and line ending: decoding takes any.
+    /// Builds a decoder running the backend of `codec`, whatever its line
+    /// ending: the text of encoded words in Q mode, a MIME body otherwise.
     pub fn new(codec: QuotedPrintableCodec) -> Self {
         Self {
-            cpu: codec.cpu,
+            codec,
             ..Self::default()
         }
     }
@@ -80,9 +87,9 @@ impl QuotedPrintableDecode {
     /// next chunk; one byte of room always lets the decoder progress. The
     /// bytes of `dst` past the ones written may be overwritten.
     pub fn resume(&mut self, src: &[u8], dst: &mut [u8]) -> QuotedPrintableDecodeOutput {
-        let (cpu, dirty) = (self.cpu, &mut self.dirty);
+        let (codec, dirty) = (self.codec, &mut self.dirty);
         let (read, written) = self.edge.resume(src, dst, |src, dst, last| {
-            tokens(cpu, &src[..src.len().min(dst.len())], dst, last, dirty)
+            tokens(codec, &src[..src.len().min(dst.len())], dst, last, dirty)
         });
 
         QuotedPrintableDecodeOutput {
@@ -100,7 +107,7 @@ impl QuotedPrintableDecode {
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         let mut dirty = self.dirty;
         let written = self.edge.finish(dst, |src, dst| {
-            tokens(self.cpu, src, dst, true, &mut dirty)[1]
+            tokens(self.codec, src, dst, true, &mut dirty)[1]
         })?;
         self.dirty = false;
 
@@ -137,7 +144,7 @@ impl QuotedPrintableCodec {
         }
 
         let mut dirty = false;
-        let [read, written, _] = tokens(self.cpu, src, dst, true, &mut dirty);
+        let [read, written, _] = tokens(self, src, dst, true, &mut dirty);
 
         Some(QuotedPrintableDecodeOutput {
             read,
@@ -167,20 +174,25 @@ impl QuotedPrintableCodec {
 }
 
 /// Decodes the tokens of `src` into `dst`, at least as long, with the
-/// blocks of the backend `cpu` names, returning the bytes read, written and
-/// held.
+/// blocks of the backend the codec's token names, or in Q mode the Q loop,
+/// returning the bytes read, written and held.
 ///
 /// Unless `last` tells that the input ends with `src`, an escape, a soft
 /// break or a CR cut short is left unread, and the spaces and tabs a line
 /// break would delete are held: written past the ones counted, for the
 /// caller to carry.
 fn tokens(
-    cpu: QuotedPrintableCpu,
+    codec: QuotedPrintableCodec,
     src: &[u8],
     dst: &mut [u8],
     last: bool,
     dirty: &mut bool,
 ) -> [usize; 3] {
+    if codec.mode == QuotedPrintableMode::Q {
+        return words(src, dst, last, dirty);
+    }
+
+    let cpu = codec.cpu;
     let mut read = 0;
     let mut written = 0;
     let mut blanks = 0;
@@ -197,6 +209,12 @@ fn tokens(
             #[cfg(target_arch = "x86_64")]
             // SAFETY: the token names a backend the CPU supports.
             QuotedPrintableBackend::Avx512 => unsafe { avx512::decode(rest, out, prev, dirty) },
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: the token names a backend the CPU supports.
+            QuotedPrintableBackend::Avx2 => unsafe { avx2::decode(rest, out, prev, dirty) },
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            // SAFETY: the token names a backend the CPU supports.
+            QuotedPrintableBackend::Neon => unsafe { neon::decode(rest, out, prev, dirty) },
             QuotedPrintableBackend::Portable => blocks(rest, &end, out, prev, dirty),
         };
         let ran = src[read..read + r].iter().rev().take(BLANKS_MAX + 1);
@@ -258,6 +276,37 @@ fn tokens(
 
         blanks = 0;
     }
+}
+
+/// Decodes the Q text `src` into `dst`, at least as long, returning the bytes
+/// read and written, and none held: `_` reads as a space and an escape in
+/// either case as its byte, a `=` starting no escape stays and turns `dirty`
+/// true, and any other byte stays. Unless `last`, a `=` less than 2 bytes from
+/// the end of `src` is left unread.
+fn words(src: &[u8], dst: &mut [u8], last: bool, dirty: &mut bool) -> [usize; 3] {
+    let mut read = 0;
+    let mut written = 0;
+
+    while let Some(&byte) = src.get(read) {
+        let (out, len) = match (byte, src.get(read + 1..read + 3)) {
+            (b'_', _) => (b' ', 1),
+            (b'=', Some(&[high, low])) if escape(high, low) < 0x8000 => {
+                (escape(high, low) as u8, 3)
+            }
+            (b'=', None) if !last => break,
+            (b'=', _) => {
+                *dirty = true;
+                (b'=', 1)
+            }
+            _ => (byte, 1),
+        };
+
+        dst[written] = out;
+        read += len;
+        written += 1;
+    }
+
+    [read, written, 0]
 }
 
 /// Decodes `src` into `dst`, at least as long, in blocks of 32 bytes, up to
@@ -379,7 +428,7 @@ mod tests {
     use simd_cpu::SimdCpu;
 
     use crate::{
-        codec::QuotedPrintableEol,
+        codec::{QuotedPrintableEol, QuotedPrintableMode},
         cpu::{QuotedPrintableCpu, available},
         decode::*,
     };
@@ -387,15 +436,21 @@ mod tests {
     const CODEC: QuotedPrintableCodec = QuotedPrintableCodec {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
-        binary: false,
+        mode: QuotedPrintableMode::Text,
     };
 
-    /// The decoding of `input` under every backend, checked the same.
-    fn decoded(input: &[u8]) -> (Vec<u8>, bool) {
+    const Q: QuotedPrintableCodec = QuotedPrintableCodec {
+        mode: QuotedPrintableMode::Q,
+        ..CODEC
+    };
+
+    /// The decoding of `input` by `codec` under every backend, checked the
+    /// same.
+    fn decoded(codec: QuotedPrintableCodec, input: &[u8]) -> (Vec<u8>, bool) {
         let outs: Vec<_> = available()
             .into_iter()
             .map(|cpu| {
-                let codec = QuotedPrintableCodec { cpu, ..CODEC };
+                let codec = QuotedPrintableCodec { cpu, ..codec };
                 let mut out = vec![0; codec.decoded_len_max(input.len())];
                 let output = codec.decode(input, &mut out).unwrap();
                 out.truncate(output.written);
@@ -417,42 +472,45 @@ mod tests {
 
     #[test]
     fn escapes_become_bytes() {
-        assert_eq!(decoded(b"a=3Db=C3=A9"), clean("a=bé".as_bytes()));
-        assert_eq!(decoded(b"=c3=a9"), unclean("é".as_bytes()));
+        assert_eq!(decoded(CODEC, b"a=3Db=C3=A9"), clean("a=bé".as_bytes()));
+        assert_eq!(decoded(CODEC, b"=c3=a9"), unclean("é".as_bytes()));
     }
 
     #[test]
     fn soft_breaks_are_joined() {
-        assert_eq!(decoded(b"ab=\r\ncd=\nef= \t\r\ng="), clean(b"abcdefg"));
-        assert_eq!(decoded(b"ab= "), clean(b"ab"));
+        assert_eq!(
+            decoded(CODEC, b"ab=\r\ncd=\nef= \t\r\ng="),
+            clean(b"abcdefg")
+        );
+        assert_eq!(decoded(CODEC, b"ab= "), clean(b"ab"));
     }
 
     #[test]
     fn line_final_blanks_are_deleted() {
-        assert_eq!(decoded(b"a \t\r\nb \nc  "), clean(b"a\r\nb\nc"));
-        assert_eq!(decoded(b"a  b"), clean(b"a  b"));
+        assert_eq!(decoded(CODEC, b"a \t\r\nb \nc  "), clean(b"a\r\nb\nc"));
+        assert_eq!(decoded(CODEC, b"a  b"), clean(b"a  b"));
     }
 
     #[test]
     fn a_bare_cr_is_dropped_and_reported() {
-        assert_eq!(decoded(b"a\rb"), unclean(b"ab"));
-        assert_eq!(decoded(b"a \r"), unclean(b"a"));
+        assert_eq!(decoded(CODEC, b"a\rb"), unclean(b"ab"));
+        assert_eq!(decoded(CODEC, b"a \r"), unclean(b"a"));
     }
 
     #[test]
     fn malformed_escapes_are_kept_and_reported() {
-        assert_eq!(decoded(b"a=zb"), unclean(b"a=zb"));
-        assert_eq!(decoded(b"a=4zb"), unclean(b"a=4zb"));
-        assert_eq!(decoded(b"a=4"), unclean(b"a=4"));
-        assert_eq!(decoded(b"a= b"), unclean(b"a= b"));
-        assert_eq!(decoded(b"a= \rb"), unclean(b"a= b"));
-        assert_eq!(decoded(b"a==41"), unclean(b"a=A"));
+        assert_eq!(decoded(CODEC, b"a=zb"), unclean(b"a=zb"));
+        assert_eq!(decoded(CODEC, b"a=4zb"), unclean(b"a=4zb"));
+        assert_eq!(decoded(CODEC, b"a=4"), unclean(b"a=4"));
+        assert_eq!(decoded(CODEC, b"a= b"), unclean(b"a= b"));
+        assert_eq!(decoded(CODEC, b"a= \rb"), unclean(b"a= b"));
+        assert_eq!(decoded(CODEC, b"a==41"), unclean(b"a=A"));
     }
 
     #[test]
     fn unsafe_bytes_are_kept_and_reported() {
-        assert_eq!(decoded(b"a\x00b"), unclean(b"a\x00b"));
-        assert_eq!(decoded("é".as_bytes()), unclean("é".as_bytes()));
+        assert_eq!(decoded(CODEC, b"a\x00b"), unclean(b"a\x00b"));
+        assert_eq!(decoded(CODEC, "é".as_bytes()), unclean("é".as_bytes()));
     }
 
     #[test]
@@ -461,7 +519,7 @@ mod tests {
         input.extend_from_slice(b"\r\n");
         let mut expected = vec![b' '; 2];
         expected.extend_from_slice(b"\r\n");
-        assert_eq!(decoded(&input), clean(&expected));
+        assert_eq!(decoded(CODEC, &input), clean(&expected));
     }
 
     #[test]
@@ -472,23 +530,46 @@ mod tests {
             .take(2000)
             .collect();
 
-        for binary in [false, true] {
-            let codec = QuotedPrintableCodec { binary, ..CODEC };
+        for mode in [
+            QuotedPrintableMode::Text,
+            QuotedPrintableMode::Binary,
+            QuotedPrintableMode::Q,
+        ] {
+            let codec = QuotedPrintableCodec { mode, ..CODEC };
             let mut encoded = vec![0; codec.encoded_len_max(input.len()).unwrap()];
             let len = codec.encode(&input, &mut encoded).unwrap();
-            let (out, is_clean) = decoded(&encoded[..len]);
+            let (out, is_clean) = decoded(codec, &encoded[..len]);
             assert!(is_clean);
 
-            if binary {
-                assert_eq!(out, input);
-            } else {
+            if mode == QuotedPrintableMode::Text {
                 assert!(
                     encoded[..len]
                         .split(|&b| b == b'\n')
                         .all(|line| line.len() <= 77)
                 );
+            } else {
+                assert_eq!(out, input);
             }
         }
+    }
+
+    #[test]
+    fn q_reads_underscores_as_spaces() {
+        assert_eq!(
+            decoded(Q, b"caf=C3=A9_au_lait"),
+            clean("café au lait".as_bytes())
+        );
+        assert_eq!(decoded(Q, b"caf=c3=a9"), clean("café".as_bytes()));
+    }
+
+    #[test]
+    fn q_reports_only_a_broken_escape() {
+        assert_eq!(decoded(Q, b"a=zb"), unclean(b"a=zb"));
+        assert_eq!(decoded(Q, b"a=4"), unclean(b"a=4"));
+        assert_eq!(decoded(Q, b"a="), unclean(b"a="));
+        assert_eq!(decoded(Q, b"a==41"), unclean(b"a=A"));
+        assert_eq!(decoded(Q, b"ab=\r\ncd"), unclean(b"ab=\r\ncd"));
+        assert_eq!(decoded(Q, b"x \t\r\n\r\xe9?"), clean(b"x \t\r\n\r\xe9?"));
     }
 
     #[test]
@@ -496,8 +577,11 @@ mod tests {
         let mut input = vec![b'\t'; BLANKS_MAX];
         input.extend_from_slice(b"x=41=\r\n");
 
-        for cpu in available() {
-            let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec { cpu, ..CODEC });
+        for codec in available()
+            .iter()
+            .flat_map(|&cpu| [CODEC, Q].map(|codec| QuotedPrintableCodec { cpu, ..codec }))
+        {
+            let mut decoder = QuotedPrintableDecode::new(codec);
             let mut src = &input[..];
             let mut out = Vec::new();
             let mut room = [0; 1];
@@ -509,8 +593,13 @@ mod tests {
                 src = &src[output.read..];
             }
 
+            // NOTE: in Q mode the input ends in bytes still queued.
+            while decoder.resume(&[], &mut room).written > 0 {
+                out.push(room[0]);
+            }
+
             assert_eq!(decoder.finish(&mut room).unwrap().written, 0);
-            assert_eq!(out, decoded(&input).0);
+            assert_eq!(out, decoded(codec, &input).0);
         }
     }
 
