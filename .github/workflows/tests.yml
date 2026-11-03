@@ -33,7 +33,7 @@ jobs:
       - run: cargo test --all-features
 
   miri:
-    name: miri (portable, AVX2 and NEON kernels)
+    name: miri (portable and AVX2 kernels)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,7 +44,19 @@ jobs:
       - run: cargo miri test --lib
         env:
           RUSTFLAGS: -C target-feature=+avx2,+bmi1,+lzcnt,+popcnt
-      - run: cargo miri test --lib --target aarch64-unknown-linux-gnu
+
+  # NOTE: on an arm runner rather than with `--target` from x86, whose
+  # runner has no aarch64 C compiler for the build scripts of the
+  # dev-dependencies (criterion's alloca).
+  miri-aarch64:
+    name: miri (NEON kernels)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - run: cargo miri test --lib
 
   fuzz:
     name: fuzz (short runs)
