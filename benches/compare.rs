@@ -1,3 +1,5 @@
+//! # Comparison benchmark
+//!
 //! Throughput of quoted-printable-codec against encodify, the
 //! quoted_printable crate and mail-parser, encoding and decoding three kinds
 //! of body (ASCII text, accented text, binary), from 64 bytes to 10 MiB.

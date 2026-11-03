@@ -6,9 +6,11 @@
 //! Text mode writes LF and CRLF as hard line breaks; binary mode escapes CR
 //! and LF. Both escape `=`, bytes from 0x7F, controls but TAB, a bare CR in
 //! text mode and a line-ending blank, as uppercase `=XX`, never split across
-//! lines. Q mode (RFC 2047) keeps letters, digits and `!*+-/`, writes a space
-//! as `_`, escapes the rest and breaks no line: the caller splits the words,
-//! sized by [`QuotedPrintableCodec::encoded_len`].
+//! lines.
+//!
+//! Q mode (RFC 2047) keeps letters, digits and `!*+-/`, writes a space as `_`,
+//! escapes the rest and breaks no line: the caller splits the words, sized by
+//! [`QuotedPrintableCodec::encoded_len`].
 //!
 //! [`QuotedPrintableEncode`] takes the input chunk by chunk;
 //! [`QuotedPrintableCodec::encode`] takes it whole.
@@ -29,10 +31,11 @@ use crate::{
 /// The most characters a line holds before its soft break `=`.
 pub(crate) const LINE: usize = 75;
 
-/// The output bytes a block may touch. A portable block commits under 128
-/// and copies a run whole past them. An AVX-512 chunk writes three groups of
-/// 66 at most, storing up to 68 past each start. An AVX2 or NEON group writes
-/// 51 at most, storing up to 99 past its start.
+/// The output bytes a block may touch.
+///
+/// A portable block commits under 128 and copies a run whole past them. An
+/// AVX-512 chunk writes three groups of 66 at most, storing up to 68 past each
+/// start. An AVX2 or NEON group writes 51 at most, storing up to 99 past it.
 pub(crate) const ROOM: usize = 200;
 
 /// Runs the SIMD encoder `$kernel` for the mode, line ending and guard of
@@ -66,9 +69,12 @@ macro_rules! kernel {
 /// carried until the next byte tells whether a line ends there.
 ///
 /// ```
-/// use quoted_printable_codec::{codec::QuotedPrintableCodec, encode::QuotedPrintableEncode};
+/// use quoted_printable_codec::{
+///     codec::QuotedPrintableCodec, encode::QuotedPrintableEncode,
+/// };
 ///
-/// let mut encoder = QuotedPrintableEncode::new(QuotedPrintableCodec::default());
+/// let codec = QuotedPrintableCodec::default();
+/// let mut encoder = QuotedPrintableEncode::new(codec);
 /// let mut out = [0; 32];
 ///
 /// let first = encoder.resume(b"a = b ", &mut out);
@@ -110,7 +116,7 @@ impl QuotedPrintableEncode {
         QuotedPrintableEncodeOutput { read, written }
     }
 
-    /// Ends the input: writes the queue and the carried blank or CR.
+    /// Ends the input, writing the queue and the carried blank or CR.
     ///
     /// Returns the bytes written and resets the encoder, or none, writing
     /// nothing, when `dst` is too short.
@@ -158,18 +164,18 @@ impl QuotedPrintableCodec {
         out.truncate(start + written);
     }
 
-    /// The room [`encode`](Self::encode) needs for any `len` input bytes, or
-    /// none on `usize` overflow.
+    /// The room [`encode`](Self::encode) needs for any input of `len` bytes.
     ///
-    /// Three characters a byte, one soft break per 25 bytes at most, and the
-    /// room a block writes ahead.
+    /// None on `usize` overflow. Three characters a byte, one soft break per 25
+    /// bytes at most, and the room a block writes ahead.
     pub fn encoded_len_max(self, len: usize) -> Option<usize> {
         let breaks = (len / 25 + 1).checked_mul(self.eol.soft_break().1)?;
         len.checked_mul(3)?.checked_add(breaks + ROOM)
     }
 
-    /// The exact length [`encode`](Self::encode) writes for `src`: counted in
-    /// Q mode, encoded into scratch otherwise.
+    /// The exact length [`encode`](Self::encode) writes for `src`.
+    ///
+    /// Counted in Q mode, encoded into scratch otherwise.
     pub fn encoded_len(self, src: &[u8]) -> usize {
         if self.mode == QuotedPrintableMode::Q {
             let width = |&byte: &u8| {
@@ -333,8 +339,7 @@ const fn is_phrase(byte: u8) -> bool {
 ///
 /// Takes the group's escape, line feed and dropped CR masks, its output
 /// length and the column before it. The break goes before the unit crossing
-/// the line's room, unless a line break comes first. A group holds 16 bytes
-/// at most, so one break suffices.
+/// the line's room unless a line break comes first: 16 bytes need one at most.
 #[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_feature = "neon")

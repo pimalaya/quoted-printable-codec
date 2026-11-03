@@ -1,9 +1,11 @@
 //! # AVX2 backend
 //!
 //! The AVX-512 steps on 32-byte vectors, for x86_64 CPUs without AVX-512
-//! VBMI2. `vpshufb` compresses 8 lanes at a time from a shuffle table. No
-//! step uses `pext` or `pdep`, microcoded on Zen 2. Encoding marks unused
-//! lanes by their high bit and places the soft break with [`line()`].
+//! VBMI2.
+//!
+//! `vpshufb` compresses 8 lanes at a time from a shuffle table. No step uses
+//! `pext` or `pdep`, microcoded on Zen 2. Encoding marks unused lanes by their
+//! high bit and places the soft break with [`line()`].
 
 use core::arch::x86_64::*;
 

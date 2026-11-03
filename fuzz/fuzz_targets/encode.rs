@@ -1,9 +1,12 @@
+//! # Encode fuzz target
+//!
 //! Every backend encodes any input in any mode and line ending, one-shot or
 //! resumed over any chunks and room, to the bytes of the portable one, as
-//! many as `encoded_len` tells, which decode back clean to the input, its
-//! line breaks as the mode writes them: a body in lines of at most 76
-//! characters, none starting with `.`, `F` or `-` when guarded, Q text with
-//! no line break at all.
+//! many as `encoded_len` tells.
+//!
+//! Those bytes decode back clean to the input, its line breaks as the mode
+//! writes them: a body in lines of at most 76 characters, none starting with
+//! `.`, `F` or `-` when guarded, Q text with no line break at all.
 
 #![no_main]
 

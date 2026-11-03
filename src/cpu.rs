@@ -12,8 +12,10 @@ pub struct QuotedPrintableCpu {
 }
 
 impl QuotedPrintableCpu {
-    /// The widest backend `cpu` supports: AVX-512 (VBMI, VBMI2, BMI1, BMI2,
-    /// LZCNT, POPCNT), AVX2 (BMI1, LZCNT, POPCNT), NEON, then portable.
+    /// The widest backend `cpu` supports.
+    ///
+    /// AVX-512 (VBMI, VBMI2, BMI1, BMI2, LZCNT, POPCNT) first, then AVX2 (BMI1,
+    /// LZCNT, POPCNT), NEON, and the portable one.
     pub const fn new(cpu: SimdCpu) -> Self {
         use simd_cpu::SimdFeature::{
             Avx2, Avx512Vbmi, Avx512Vbmi2, Bmi1, Bmi2, Lzcnt, Neon, Popcnt,

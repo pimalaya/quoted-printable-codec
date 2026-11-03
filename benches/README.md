@@ -1,8 +1,8 @@
 # Benchmarks
 
-[criterion](https://crates.io/crates/criterion) medians of `cargo bench --bench compare` (source in [compare.rs](./compare.rs)), in GiB/s of raw bytes on both sides. Measured on 2026-11-01, rustc 1.99, Linux x86_64 on an AMD Ryzen AI Max+ 395 (Zen 5), pinned to one core with `taskset -c 13`, all groups in one run, on a machine shared with other work. Each cell is the median of three runs; "before" is the published median of the pass before (commit 72d8dc6, whose code 2c7604e kept).
+[criterion](https://crates.io/crates/criterion) medians of `cargo bench --bench compare` (source in [compare.rs](./compare.rs)), in GiB/s of raw bytes on both sides. Measured on 2026-11-01, rustc 1.99, Linux x86_64 on an AMD Ryzen AI Max+ 395 (Zen 5), pinned to one core with `taskset -c 13`, all groups in one run, on a machine shared with other work. Each cell is the median of three runs, quoted-printable-codec's encoding cells moving by up to 4% between runs and its decoding cells by up to 11%; "before" is the published median of the pass before (commit 72d8dc6, whose code 2c7604e kept).
 
-- quoted-printable-codec 0.0.1: the AVX-512 backend `QuotedPrintableCpu::new(SimdCpu::detect())` picks on this CPU, blocks of 64 bytes with the VBMI2 byte compress, no branch on the data and each block read ahead; short text with few bytes to escape goes through the portable walk.
+- quoted-printable-codec 0.0.1: the AVX-512 backend `QuotedPrintableCpu::new(SimdCpu::detect())` picks on this CPU, blocks of 64 bytes with the VBMI2 byte compress, no branch on the data and each block read ahead; short text with few bytes to escape goes through the portable walk. A CPU without AVX-512 VBMI2 runs the AVX2 backend, and aarch64 the NEON one; neither is measured yet.
 - encodify 1.0.2: `qp::BODY` (and `qp::BINARY` to encode binary), into a slice; it runs AVX2 here.
 - quoted_printable 0.5.2: `encode`, `encode_binary` and `decode` in `ParseMode::Robust`; they allocate their output, as their API asks.
 - mail-parser 0.11.9: `decoders::quoted_printable::quoted_printable_decode`, decoding only; it allocates its output.

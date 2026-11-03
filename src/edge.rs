@@ -4,8 +4,9 @@
 //! for room. Cores run straight from the caller's input to its output, and
 //! fall back on the [`Edge`] only around those bytes.
 
-/// Undecided input and output waiting for room, `C` and `Q` sized for each
-/// coroutine's longest undecided token.
+/// Undecided input and output waiting for room.
+///
+/// `C` and `Q` are sized for each coroutine's longest undecided token.
 #[derive(Clone, Debug)]
 pub(crate) struct Edge<const C: usize, const Q: usize> {
     carry: [u8; C],
@@ -28,8 +29,7 @@ impl<const C: usize, const Q: usize> Default for Edge<C, Q> {
 }
 
 impl<const C: usize, const Q: usize> Edge<C, Q> {
-    /// Runs `core` over `src` into `dst`, returning the bytes read and
-    /// written.
+    /// Runs `core` over `src` into `dst`, returning the bytes read and written.
     ///
     /// `core` takes the input, the output and whether the input ends, and
     /// returns the bytes read, written and held. Held bytes sit past the

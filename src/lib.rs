@@ -1,12 +1,19 @@
+#![no_std]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
+
 //! # quoted-printable-codec
 //!
 //! Lenient quoted-printable codec for MIME bodies (RFC 2045 6.7) and the Q
 //! encoding of header words (RFC 2047 4.2), with SIMD, `no_std` and no I/O.
 //!
-//! A [`QuotedPrintableCodec`], from [`codec`], holds the backend, the mode
-//! and the line ending; its one-shot methods take a whole input.
+//! A [`QuotedPrintableCodec`], from [`codec`], holds the backend, the mode,
+//! the line ending and the line-start guard; its one-shot methods take a whole
+//! input.
+//!
 //! [`QuotedPrintableEncode`] and [`QuotedPrintableDecode`], from [`encode`]
 //! and [`decode`], are I/O-free coroutines taking the input chunk by chunk.
+//! Both keep what a call leaves undecided in the private edge module.
 //!
 //! The backend comes from the `simd_cpu::SimdCpu` token the application
 //! installs with `SimdCpu::install_detected`, or the build target's baseline.
@@ -16,8 +23,11 @@
 //! The portable backend walks the special bytes of 32-byte blocks, in safe
 //! code the compiler vectorizes. The AVX-512, AVX2 and NEON backends work
 //! branch-free on blocks of 64, 32 and 16 bytes, compressing unused bytes
-//! away. Token steps handle what a block cannot decide alone, such as a
-//! malformed escape or blanks before a line break.
+//! away.
+//!
+//! Token steps handle what a block cannot decide alone, such as a malformed
+//! escape or blanks before a line break. The behaviour each module implements
+//! is specified in cairn/spec, one file per capability.
 //!
 //! ```
 //! use quoted_printable_codec::codec::{
@@ -53,10 +63,6 @@
 //! [`QuotedPrintableCpu`]: cpu::QuotedPrintableCpu
 //! [`QuotedPrintableEncode`]: encode::QuotedPrintableEncode
 //! [`QuotedPrintableDecode`]: decode::QuotedPrintableDecode
-
-#![no_std]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
@@ -97,7 +103,7 @@ fn mask(bytes: &[u8; 64], class: impl Fn(u8) -> bool) -> u32 {
     half(&halves[0], &class) | half(&halves[1], &class) << 16
 }
 
-/// NOTE: compilers vectorize a fold of 16 lanes, not one of 32.
+/// One half of [`mask`]: compilers vectorize a fold of 16 lanes, not 32.
 #[inline(always)]
 fn half(bytes: &[u8; 16], class: &impl Fn(u8) -> bool) -> u32 {
     let lanes = bytes.iter().enumerate();

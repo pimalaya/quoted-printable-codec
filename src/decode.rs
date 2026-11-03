@@ -1,10 +1,12 @@
 //! # Decoding
 //!
 //! Lenient quoted-printable decoding of a MIME body, as RFC 2045 6.7 asks of
-//! robust implementations. Escapes decode in either case, soft breaks join,
-//! trailing blanks go, CRLF and LF stay, a bare CR stays and is reported, a
-//! malformed escape keeps its `=`. Decoding never fails: it returns the bytes
-//! and whether the input was clean.
+//! robust implementations. It never fails: it returns the bytes and whether
+//! the input was clean.
+//!
+//! Escapes decode in either case, soft breaks join, trailing blanks go, CRLF
+//! and LF stay, a bare CR stays and is reported, a malformed escape keeps its
+//! `=`.
 //!
 //! Q mode (RFC 2047) reads `_` as a space and escapes in either case, and
 //! keeps other bytes. Only a malformed escape makes it unclean, as words in
@@ -39,13 +41,17 @@ const CARRY: usize = BLANKS_MAX + 4;
 /// and trailing blanks are carried to the next call.
 ///
 /// ```
-/// use quoted_printable_codec::{codec::QuotedPrintableCodec, decode::QuotedPrintableDecode};
+/// use quoted_printable_codec::{
+///     codec::QuotedPrintableCodec, decode::QuotedPrintableDecode,
+/// };
 ///
-/// let mut decoder = QuotedPrintableDecode::new(QuotedPrintableCodec::default());
+/// let codec = QuotedPrintableCodec::default();
+/// let mut decoder = QuotedPrintableDecode::new(codec);
 /// let mut out = [0; 16];
 ///
 /// let first = decoder.resume(b"caf=C", &mut out);
-/// let second = decoder.resume(b"3=A9 =\r\n!  \r\n", &mut out[first.written..]);
+/// let rest = &mut out[first.written..];
+/// let second = decoder.resume(b"3=A9 =\r\n!  \r\n", rest);
 /// let written = first.written + second.written;
 /// let end = decoder.finish(&mut out[written..]).unwrap();
 ///
@@ -89,11 +95,11 @@ impl QuotedPrintableDecode {
         }
     }
 
-    /// Ends the input: writes the queue, an unfinished escape and a last CR,
-    /// and drops trailing blanks.
+    /// Ends the input, writing what the decoder holds.
     ///
-    /// Returns none, writing nothing, when `dst` is too short; otherwise
-    /// resets the decoder.
+    /// Writes the queue, an unfinished escape and a last CR, and drops trailing
+    /// blanks. Returns none, writing nothing, when `dst` is too short;
+    /// otherwise resets the decoder.
     pub fn finish(&mut self, dst: &mut [u8]) -> Option<QuotedPrintableDecodeOutput> {
         let mut dirty = self.dirty;
         let written = self.edge.finish(dst, |src, dst| {
@@ -143,8 +149,7 @@ impl QuotedPrintableCodec {
         })
     }
 
-    /// Decodes the whole of `src` at the end of `out`, returning whether it
-    /// was well-formed.
+    /// Appends the decoding of `src` to `out`, returning whether it was clean.
     #[cfg(feature = "alloc")]
     #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
     pub fn decode_vec(self, src: &[u8], out: &mut Vec<u8>) -> bool {
@@ -155,8 +160,9 @@ impl QuotedPrintableCodec {
         output.clean
     }
 
-    /// The most bytes [`decode`](Self::decode) writes for `len` input bytes:
-    /// each output byte takes one input byte at least.
+    /// The most bytes [`decode`](Self::decode) writes for `len` input bytes.
+    ///
+    /// Each output byte takes one input byte at least.
     pub const fn decoded_len_max(self, len: usize) -> usize {
         len
     }

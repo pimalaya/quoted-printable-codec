@@ -1,10 +1,12 @@
 //! # AVX-512 backend
 //!
 //! Branch-free 64-byte blocks with the VBMI2 byte compress, the next block
-//! read ahead. Decoding reads a block's escapes at once from loads at offsets
-//! 0, 1 and 2, and compresses digits and soft breaks away. Encoding spreads
-//! each group of 21 bytes over three lanes a byte, compresses unused lanes
-//! away, and places the soft break from masks moved by `pext`.
+//! read ahead.
+//!
+//! Decoding reads a block's escapes at once from loads at offsets 0, 1 and
+//! 2, and compresses digits and soft breaks away. Encoding spreads each group
+//! of 21 bytes over three lanes a byte, compresses unused lanes away, and
+//! places the soft break from masks moved by `pext`.
 
 use core::{arch::x86_64::*, hint::select_unpredictable};
 

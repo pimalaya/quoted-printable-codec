@@ -1,9 +1,10 @@
 //! # NEON backend
 //!
-//! The AVX-512 steps on 16-byte vectors, for aarch64. `tbl` compresses 8
-//! lanes at a time from a shuffle table, and a mask sums lane-weighted bits.
-//! Encoding spreads bytes with a three-table `tbl`, marks unused lanes by
-//! their high bit and places the soft break with [`line()`].
+//! The AVX-512 steps on 16-byte vectors, for aarch64.
+//!
+//! `tbl` compresses 8 lanes at a time from a shuffle table, and a mask sums
+//! lane-weighted bits. Encoding spreads bytes with a three-table `tbl`, marks
+//! unused lanes by their high bit and places the soft break with [`line()`].
 
 use core::arch::aarch64::*;
 

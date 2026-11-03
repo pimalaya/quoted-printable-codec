@@ -8,8 +8,7 @@ use simd_cpu::SimdCpu;
 
 use crate::cpu::QuotedPrintableCpu;
 
-/// The backend, the mode, the line ending of encoded output and the line-start
-/// guard.
+/// The backend, mode, line ending and line-start guard every call runs with.
 ///
 /// A stateless value, built once and used for every call. Defaults to text
 /// with CRLF, unguarded, on the installed token's backend. Another token goes
@@ -22,18 +21,20 @@ pub struct QuotedPrintableCodec {
     pub eol: QuotedPrintableEol,
     /// MIME body text or binary, or RFC 2047 encoded-word text.
     pub mode: QuotedPrintableMode,
-    /// Whether encoding escapes a `.`, `F` or `-` starting an output line, in
-    /// text and binary mode, so that no line reads as an SMTP end of data, an
-    /// mbox `From ` line or a MIME boundary delimiter (RFC 2049 3(8)). Q mode
-    /// and decoding ignore it.
+    /// Whether encoding escapes a `.`, `F` or `-` starting an output line.
+    ///
+    /// No line then reads as an SMTP end of data, an mbox `From ` line or a
+    /// MIME boundary delimiter (RFC 2049 3(8)). Text and binary mode only: Q
+    /// mode and decoding ignore it.
     ///
     /// Refs: <https://datatracker.ietf.org/doc/html/rfc2049#section-3>
     pub guard: bool,
 }
 
 impl QuotedPrintableCodec {
-    /// Text with CRLF, unguarded, on the build target's backend, ignoring the
-    /// installed token.
+    /// Text with CRLF, unguarded, on the build target's backend.
+    ///
+    /// Ignores the installed token.
     pub const BASELINE: Self = Self {
         cpu: QuotedPrintableCpu::new(SimdCpu::BASELINE),
         eol: QuotedPrintableEol::Crlf,
@@ -52,10 +53,9 @@ pub enum QuotedPrintableMode {
     Binary,
     /// The RFC 2047 Q encoding of encoded-word text, in header fields.
     ///
-    /// Letters, digits and `!*+-/` stay literal, a space becomes `_`, other
-    /// bytes are escaped. No line breaks: the caller splits the words.
-    /// Decoding reports only a `=` starting no escape, as words in the wild
-    /// carry raw bytes and lowercase digits.
+    /// Letters, digits and `!*+-/` stay, a space becomes `_`, the rest is
+    /// escaped, with no line break: the caller splits words. Decoding reports
+    /// a stray `=` only: words in the wild carry raw bytes and lowercase hex.
     ///
     /// Refs: <https://datatracker.ietf.org/doc/html/rfc2047#section-4.2>
     Q,

@@ -1,3 +1,5 @@
+//! # Decode fuzz target
+//!
 //! Every backend decodes any input as a body or as Q text, one-shot or
 //! resumed over any chunks and room, to the bytes and clean flag of the
 //! portable one, without panicking.
